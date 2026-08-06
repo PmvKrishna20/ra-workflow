@@ -1,0 +1,6 @@
+*.db 
+*.sqlite3 
+.streamlit/secrets.toml 
+__pycache__/ 
+*.pyc 
+.env
