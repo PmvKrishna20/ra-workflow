@@ -307,6 +307,47 @@ def init_db():
             )
             conn.commit()
 
+    # ---------- Workpage: positions + their prospects ----------
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_name TEXT NOT NULL,
+            job_title TEXT,
+            status TEXT NOT NULL DEFAULT 'Sourcing',
+            assigned_ra TEXT,
+            source TEXT,
+            location TEXT,
+            job_url TEXT,
+            notes TEXT,
+            created_by TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+    """)
+    # Enforce "one ACTIVE position per company" at the database level.
+    # A closed position doesn't block a fresh one being opened later.
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_one_active_per_company
+        ON positions (company_name) WHERE status <> 'Closed'
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_assigned_ra ON positions(assigned_ra)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS position_prospects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_id INTEGER NOT NULL,
+            first_name TEXT,
+            email TEXT,
+            designation TEXT,
+            status TEXT NOT NULL DEFAULT 'Not contacted',
+            notes TEXT,
+            added_by TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_position_prospects_position ON position_prospects(position_id)")
+    conn.commit()
+
     conn.close()
 
 # ---------- User / auth functions ----------
@@ -369,47 +410,6 @@ def reset_user_password(user_id, new_raw_password):
     conn = get_connection()
     conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(new_raw_password), user_id))
     conn.commit()
-    # ---------- Workpage: positions + their prospects ----------
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS positions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            company_name TEXT NOT NULL,
-            job_title TEXT,
-            status TEXT NOT NULL DEFAULT 'Sourcing',
-            assigned_ra TEXT,
-            source TEXT,
-            location TEXT,
-            job_url TEXT,
-            notes TEXT,
-            created_by TEXT,
-            created_at TEXT,
-            updated_at TEXT
-        )
-    """)
-    # Enforce "one ACTIVE position per company" at the database level.
-    # A closed position doesn't block a fresh one being opened later.
-    conn.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_one_active_per_company
-        ON positions (company_name) WHERE status <> 'Closed'
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_assigned_ra ON positions(assigned_ra)")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS position_prospects (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            position_id INTEGER NOT NULL,
-            first_name TEXT,
-            email TEXT,
-            designation TEXT,
-            status TEXT NOT NULL DEFAULT 'Not contacted',
-            notes TEXT,
-            added_by TEXT,
-            created_at TEXT,
-            updated_at TEXT
-        )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_position_prospects_position ON position_prospects(position_id)")
-    conn.commit()
-
     conn.close()
 
 # ---------- Company functions ----------
@@ -2116,9 +2116,6 @@ with st.sidebar:
         f'Signed in as <b>{CURRENT_NAME}</b><br><span style="opacity:.7;">{CURRENT_ROLE}</span></div>',
         unsafe_allow_html=True
     )
-    if st.button("Log out", key="logout_btn"):
-        del st.session_state["current_user"]
-        st.rerun()
 
     for group, items in NAV:
         st.markdown(f'<div class="nav-group">{group}</div>', unsafe_allow_html=True)
@@ -2133,6 +2130,11 @@ with st.sidebar:
     if st.button(mode_label, key="theme_toggle"):
         st.session_state.theme_mode = "light" if st.session_state.theme_mode == "dark" else "dark"
         set_setting("theme_mode", st.session_state.theme_mode)
+        st.rerun()
+
+    st.markdown('<div class="nav-group">Account</div>', unsafe_allow_html=True)
+    if st.button("Log out", key="logout_btn"):
+        del st.session_state["current_user"]
         st.rerun()
 
 
