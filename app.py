@@ -29,6 +29,7 @@ from datetime import date, timedelta
 
 import psycopg2
 import psycopg2.extensions
+import psycopg2.extras
 
 
 def _adapt_sql(sql: str) -> str:
@@ -338,19 +339,19 @@ def list_users():
 
 def create_user(username, raw_password, display_name, role):
     conn = get_connection()
-    try:
-        conn.execute(
-            "INSERT INTO users (username, password_hash, display_name, role, active, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (username.strip().lower(), hash_password(raw_password), display_name.strip(),
-             role, 1, date.today().isoformat())
-        )
-        conn.commit()
-        return True, "User created."
-    except Exception as e:
-        return False, f"Could not create user (username may already exist): {e}"
-    finally:
+    username = username.strip().lower()
+    existing = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+    if existing:
         conn.close()
+        return False, "That username is already taken."
+    conn.execute(
+        "INSERT INTO users (username, password_hash, display_name, role, active, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (username, hash_password(raw_password), display_name.strip(), role, 1, date.today().isoformat())
+    )
+    conn.commit()
+    conn.close()
+    return True, "User created."
 
 def set_user_active(user_id, active):
     conn = get_connection()
@@ -368,6 +369,47 @@ def reset_user_password(user_id, new_raw_password):
     conn = get_connection()
     conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(new_raw_password), user_id))
     conn.commit()
+    # ---------- Workpage: positions + their prospects ----------
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_name TEXT NOT NULL,
+            job_title TEXT,
+            status TEXT NOT NULL DEFAULT 'Sourcing',
+            assigned_ra TEXT,
+            source TEXT,
+            location TEXT,
+            job_url TEXT,
+            notes TEXT,
+            created_by TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+    """)
+    # Enforce "one ACTIVE position per company" at the database level.
+    # A closed position doesn't block a fresh one being opened later.
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_one_active_per_company
+        ON positions (company_name) WHERE status <> 'Closed'
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_assigned_ra ON positions(assigned_ra)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS position_prospects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_id INTEGER NOT NULL,
+            first_name TEXT,
+            email TEXT,
+            designation TEXT,
+            status TEXT NOT NULL DEFAULT 'Not contacted',
+            notes TEXT,
+            added_by TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_position_prospects_position ON position_prospects(position_id)")
+    conn.commit()
+
     conn.close()
 
 # ---------- Company functions ----------
@@ -387,6 +429,152 @@ def add_company(company_name, position, added_by):
     conn.execute(
         "INSERT INTO companies (company_name, position, added_by, date_added, source) VALUES (?, ?, ?, ?, ?)",
         (company_name, position, added_by, date.today().isoformat(), "manual")
+    )
+    conn.commit()
+    conn.close()
+
+# ---------- Workpage: positions + prospects ----------
+
+PIPELINE_STAGES = ["Sourcing", "Outreach Sent", "Response Received", "In Progress", "Closed"]
+
+def create_position(company_name, job_title, assigned_ra, source, created_by, location="", job_url=""):
+    """Creates a new active position for a company. Returns False without creating
+    anything if that company already has an active (non-Closed) position. The
+    partial unique index on positions is still there as a safety net for the rare
+    case of two people saving at the same instant — the adapter auto-appends
+    ON CONFLICT DO NOTHING to inserts, so a race just silently no-ops rather than
+    erroring."""
+    conn = get_connection()
+    existing = conn.execute(
+        "SELECT id FROM positions WHERE company_name = ? AND status <> 'Closed'", (company_name,)
+    ).fetchone()
+    if existing:
+        conn.close()
+        return False
+    now = date.today().isoformat()
+    conn.execute(
+        "INSERT INTO positions (company_name, job_title, status, assigned_ra, source, "
+        "location, job_url, notes, created_by, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (company_name, job_title, "Sourcing", assigned_ra, source, location, job_url,
+         "", created_by, now, now)
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+def bulk_create_positions_from_assignments(rows):
+    """rows: (batch_id, company_name, job_title, location, job_url, ra_name, assigned_date) —
+    same shape bulk_insert_assignments takes. Creates a matching position for each company
+    that doesn't already have an active one; skips the rest quietly."""
+    created = 0
+    for batch_id, company, title, location, url, ra_name, assigned_date in rows:
+        ok = create_position(company, title, ra_name, "auto_assigned", "RA Assignments", location, url)
+        if ok:
+            created += 1
+    return created
+
+def get_positions_for_ra(ra_name, include_closed=False):
+    conn = get_connection()
+    if include_closed:
+        rows = conn.execute(
+            "SELECT id, company_name, job_title, status, updated_at FROM positions "
+            "WHERE assigned_ra = ? ORDER BY updated_at DESC", (ra_name,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, company_name, job_title, status, updated_at FROM positions "
+            "WHERE assigned_ra = ? AND status <> 'Closed' ORDER BY updated_at DESC", (ra_name,)
+        ).fetchall()
+    conn.close()
+    return rows
+
+def get_all_positions(status_filter=None, ra_filter=None):
+    conn = get_connection()
+    sql = "SELECT id, company_name, job_title, status, assigned_ra, updated_at FROM positions WHERE 1=1"
+    params = []
+    if status_filter and status_filter != "All":
+        sql += " AND status = ?"
+        params.append(status_filter)
+    if ra_filter and ra_filter != "All":
+        sql += " AND assigned_ra = ?"
+        params.append(ra_filter)
+    sql += " ORDER BY updated_at DESC"
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    conn.close()
+    return rows
+
+def get_position(position_id):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT id, company_name, job_title, status, assigned_ra, source, location, job_url, "
+        "notes, created_by, created_at, updated_at FROM positions WHERE id = ?", (position_id,)
+    ).fetchone()
+    conn.close()
+    return row
+
+def update_position(position_id, status=None, notes=None, job_title=None, assigned_ra=None):
+    conn = get_connection()
+    row = conn.execute("SELECT status, notes, job_title, assigned_ra FROM positions WHERE id = ?", (position_id,)).fetchone()
+    if row is None:
+        conn.close()
+        return
+    cur_status, cur_notes, cur_title, cur_ra = row
+    conn.execute(
+        "UPDATE positions SET status = ?, notes = ?, job_title = ?, assigned_ra = ?, updated_at = ? WHERE id = ?",
+        (status if status is not None else cur_status,
+         notes if notes is not None else cur_notes,
+         job_title if job_title is not None else cur_title,
+         assigned_ra if assigned_ra is not None else cur_ra,
+         date.today().isoformat(), position_id)
+    )
+    conn.commit()
+    conn.close()
+
+def get_ra_names_with_positions():
+    conn = get_connection()
+    rows = conn.execute("SELECT DISTINCT assigned_ra FROM positions WHERE assigned_ra IS NOT NULL ORDER BY assigned_ra").fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def count_positions_by_status():
+    conn = get_connection()
+    rows = conn.execute("SELECT status, COUNT(*) FROM positions GROUP BY status").fetchall()
+    conn.close()
+    return dict(rows)
+
+def add_position_prospect(position_id, first_name, email, designation, added_by):
+    conn = get_connection()
+    now = date.today().isoformat()
+    conn.execute(
+        "INSERT INTO position_prospects (position_id, first_name, email, designation, status, "
+        "notes, added_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (position_id, first_name, email, designation, "Not contacted", "", added_by, now, now)
+    )
+    conn.commit()
+    conn.close()
+
+def get_position_prospects(position_id):
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id, first_name, email, designation, status, notes FROM position_prospects "
+        "WHERE position_id = ? ORDER BY id", (position_id,)
+    ).fetchall()
+    conn.close()
+    return rows
+
+def update_position_prospect(prospect_id, status=None, notes=None):
+    conn = get_connection()
+    row = conn.execute("SELECT status, notes FROM position_prospects WHERE id = ?", (prospect_id,)).fetchone()
+    if row is None:
+        conn.close()
+        return
+    cur_status, cur_notes = row
+    conn.execute(
+        "UPDATE position_prospects SET status = ?, notes = ?, updated_at = ? WHERE id = ?",
+        (status if status is not None else cur_status,
+         notes if notes is not None else cur_notes,
+         date.today().isoformat(), prospect_id)
     )
     conn.commit()
     conn.close()
@@ -1514,6 +1702,7 @@ def handle_add_company():
         st.session_state.company_message = ("warning", f"Duplicate: '{name}' was already contacted on {prev_date} by {prev_ra} (within 30 days). Not added.")
         return
     add_company(name, position, ra)
+    create_position(name, position, ra, "manual", CURRENT_NAME)
     st.session_state.company_message = ("success", f"Added: {name}")
     st.session_state.company_input = ""
     st.session_state.position_input = ""
@@ -1907,7 +2096,8 @@ def stat_cards(cards):
 NAV = [
     ("Overview", [("Dashboard", "Dashboard")]),
     ("Pipeline", [("Bulk scrape", "Bulk scrape"), ("Add company", "Add company"),
-                  ("Review lists", "Review lists"), ("RA assignments", "RA assignments")]),
+                  ("Review lists", "Review lists"), ("RA assignments", "RA assignments"),
+                  ("Workpage", "Workpage")]),
     ("Data", [("Prospects DB", "Prospects DB"), ("EOD uploads", "EOD uploads"),
               ("Bounced & DNC", "Bounced & DNC"), ("Import history", "Import history")]),
     ("Insight", [("Analytics", "Analytics")]),
@@ -2371,6 +2561,7 @@ def page_bulk():
                         for (company, title, location, url) in chunk
                     ]
                     bulk_insert_assignments(rows_to_save)
+                    bulk_create_positions_from_assignments(rows_to_save)
                     st.session_state.last_assignment_batch = batch_id
                     st.session_state.last_assignments = assignments
                     st.session_state.last_leftover = leftover
@@ -2753,6 +2944,112 @@ def page_assignments():
         st.warning("Assignment history wiped.")
 
 
+def page_workpage():
+    page_header("Pipeline", "Workpage",
+                "Your assigned and manually-added companies, worked here directly — status, notes, and the "
+                "people you're reaching out to for each one.")
+
+    is_overseer = CURRENT_ROLE in ("TL", "Manager")
+
+    if is_overseer:
+        c1, c2 = st.columns(2)
+        with c1:
+            ra_names = ["All"] + get_ra_names_with_positions()
+            ra_pick = st.selectbox("View positions for", ra_names, key="wp_ra_filter")
+        with c2:
+            status_pick = st.selectbox("Status", ["All"] + PIPELINE_STAGES, key="wp_status_filter")
+        rows = get_all_positions(status_filter=status_pick, ra_filter=ra_pick)
+    else:
+        rows = get_positions_for_ra(CURRENT_NAME, include_closed=False)
+
+    if not rows:
+        st.info("No positions here yet. They appear automatically when you're dealt companies via "
+                 "RA Assignments, or when you add a company yourself on the 'Add company' page.")
+        return
+
+    st.write(f"**{len(rows):,}** position(s) shown.")
+
+    def _label(row):
+        if is_overseer:
+            pid, company, title, status, assigned_ra, updated = row
+            return f"{company} — {title or '(no title)'} · {status} · {assigned_ra}"
+        else:
+            pid, company, title, status, updated = row
+            return f"{company} — {title or '(no title)'} · {status}"
+
+    options = {_label(r): r[0] for r in rows}
+    picked_label = st.selectbox("Open a position", list(options.keys()), key="wp_selected_label")
+    position_id = options[picked_label]
+
+    pos = get_position(position_id)
+    if pos is None:
+        st.warning("This position no longer exists.")
+        return
+    (pid, company_name, job_title, status, assigned_ra, source, location, job_url,
+     notes, created_by, created_at, updated_at) = pos
+
+    st.divider()
+    st.markdown(f"#### {company_name}")
+    st.caption(f"Added {created_at} by {created_by} · source: {source} · last updated {updated_at}")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        new_title = st.text_input("Job title", value=job_title or "", key=f"wp_title_{pid}")
+        new_status = st.selectbox("Status", PIPELINE_STAGES,
+                                   index=PIPELINE_STAGES.index(status) if status in PIPELINE_STAGES else 0,
+                                   key=f"wp_status_{pid}")
+    with c2:
+        if is_overseer:
+            new_ra = st.text_input("Assigned RA", value=assigned_ra or "", key=f"wp_ra_{pid}")
+        else:
+            new_ra = assigned_ra
+            st.text_input("Assigned RA", value=assigned_ra or "", disabled=True, key=f"wp_ra_ro_{pid}")
+    new_notes = st.text_area("Notes", value=notes or "", key=f"wp_notes_{pid}", height=100)
+
+    if st.button("Save position", type="primary", key=f"wp_save_{pid}"):
+        update_position(pid, status=new_status, notes=new_notes, job_title=new_title, assigned_ra=new_ra)
+        st.success("Saved.")
+        st.rerun()
+
+    st.divider()
+    st.markdown("#### Prospects for this position")
+    prospects = get_position_prospects(pid)
+    if prospects:
+        for prow in prospects:
+            prospect_id, first_name, email, designation, pstatus, pnotes = prow
+            with st.container(border=True):
+                pc1, pc2, pc3 = st.columns([2, 1.5, 1.5])
+                pc1.markdown(f"**{first_name or '(no name)'}**  \n{email or ''}")
+                pc2.caption(designation or "")
+                new_pstatus = pc3.selectbox(
+                    "Status", ["Not contacted", "Emailed", "Replied", "Interested", "Not interested", "Bounced"],
+                    index=["Not contacted", "Emailed", "Replied", "Interested", "Not interested", "Bounced"].index(pstatus)
+                    if pstatus in ["Not contacted", "Emailed", "Replied", "Interested", "Not interested", "Bounced"] else 0,
+                    key=f"wp_pstatus_{prospect_id}", label_visibility="collapsed"
+                )
+                if new_pstatus != pstatus:
+                    update_position_prospect(prospect_id, status=new_pstatus)
+                    st.rerun()
+    else:
+        st.caption("No prospects added for this position yet.")
+
+    with st.expander("Add a prospect"):
+        pf1, pf2, pf3 = st.columns(3)
+        with pf1:
+            p_name = st.text_input("First name", key=f"wp_new_pname_{pid}")
+        with pf2:
+            p_email = st.text_input("Email", key=f"wp_new_pemail_{pid}")
+        with pf3:
+            p_desig = st.text_input("Designation", key=f"wp_new_pdesig_{pid}")
+        if st.button("Add prospect", key=f"wp_addp_{pid}"):
+            if not p_name.strip() and not p_email.strip():
+                st.error("Enter at least a name or email.")
+            else:
+                add_position_prospect(pid, p_name.strip(), p_email.strip(), p_desig.strip(), CURRENT_NAME)
+                st.success("Prospect added.")
+                st.rerun()
+
+
 def page_eod():
     page_header("Data", "EOD uploads",
                 "RAs submit their end-of-day sourcing sheet here. Every upload feeds new contacts straight into the Prospects DB.")
@@ -3125,6 +3422,7 @@ ROUTES = {
     "Add company": page_add,
     "Review lists": page_review,
     "RA assignments": page_assignments,
+    "Workpage": page_workpage,
     "Prospects DB": page_prospects,
     "EOD uploads": page_eod,
     "Bounced & DNC": page_bounced,
