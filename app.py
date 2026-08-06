@@ -1114,7 +1114,7 @@ def bulk_insert_assignments(rows):
 def get_assignment_batches(limit=50):
     conn = get_connection()
     rows = conn.execute(
-        "SELECT batch_id, assigned_date, COUNT(*), COUNT(DISTINCT ra_name) "
+        "SELECT batch_id, MAX(assigned_date), COUNT(*), COUNT(DISTINCT ra_name) "
         "FROM ra_assignments GROUP BY batch_id ORDER BY MAX(id) DESC LIMIT ?", (limit,)
     ).fetchall()
     conn.close()
