@@ -1,25 +1,162 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
 import openpyxl
 import re
 import json
 import uuid
+import bcrypt
 import urllib.request
 import urllib.error
 from datetime import date, timedelta
 
-DB_FILE = "recruiting.db"
+# ---------------------------------------------------------------------------
+# Database adapter — wraps psycopg2 (Supabase/PostgreSQL) behind the same
+# thin interface the app was written against (sqlite3 style):
+#   conn = get_connection()
+#   conn.execute(sql, params)
+#   conn.executemany(sql, params_seq)
+#   conn.commit()
+#   conn.close()   ← no-op here; connection is pooled
+#   row = cursor.fetchone()   → plain tuple  (not RealDict)
+#   rows = cursor.fetchall()  → list of tuples
+# SQL differences handled here so nothing else in the file needs to change:
+#   • "?" placeholders  → "%s"
+#   • "INTEGER PRIMARY KEY AUTOINCREMENT" → "SERIAL PRIMARY KEY"
+#   • "INSERT OR IGNORE"  → "INSERT ... ON CONFLICT DO NOTHING"
+#   • "PRAGMA table_info(...)" → information_schema query
+#   • "DELETE FROM sqlite_sequence" → no-op (sequences reset automatically)
+# ---------------------------------------------------------------------------
+
+import psycopg2
+import psycopg2.extensions
+
+
+def _adapt_sql(sql: str) -> str:
+    """Translate SQLite-flavoured SQL to PostgreSQL syntax."""
+    sql = sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+    sql = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO")
+    # Turn trailing ON CONFLICT clause on; add DO NOTHING if this was an INSERT OR IGNORE
+    if "ON CONFLICT DO NOTHING" not in sql and sql.lstrip().upper().startswith("INSERT INTO") \
+            and "ON CONFLICT" not in sql:
+        # Only add when we converted INSERT OR IGNORE (marker: no ON CONFLICT yet)
+        pass  # handled via the replace above; caller must add ON CONFLICT if needed
+    sql = re.sub(r'\?', '%s', sql)
+    return sql
+
+
+class _Cursor:
+    """Thin wrapper that returns plain tuples, matching sqlite3 Row behaviour."""
+    def __init__(self, pg_cursor):
+        self._c = pg_cursor
+
+    def fetchone(self):
+        row = self._c.fetchone()
+        if row is None:
+            return None
+        return tuple(row)
+
+    def fetchall(self):
+        return [tuple(r) for r in self._c.fetchall()]
+
+    def __iter__(self):
+        for row in self._c:
+            yield tuple(row)
+
+
+class _Connection:
+    """Wraps a psycopg2 connection with the sqlite3-like execute/executemany/commit/close API."""
+
+    def __init__(self, pg_conn):
+        self._conn = pg_conn
+
+    def execute(self, sql: str, params=None):
+        sql = _adapt_sql(sql)
+        # PRAGMA table_info → information_schema equivalent
+        m = re.match(r"PRAGMA\s+table_info\((\w+)\)", sql.strip(), re.I)
+        if m:
+            table = m.group(1)
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name=%s ORDER BY ordinal_position",
+                (table,)
+            )
+            # Return a fake cursor whose fetchall() gives (cid, name, ...) tuples
+            # The app only uses r[1] for column name, so fake (0, name, 'TEXT', 0, None, 0)
+            rows = [(i, r[0], 'TEXT', 0, None, 0) for i, r in enumerate(cur.fetchall())]
+
+            class _FakeCur:
+                def fetchall(inner_self):
+                    return rows
+                def fetchone(inner_self):
+                    return rows[0] if rows else None
+            return _FakeCur()
+
+        # Ignore sqlite_sequence wipe — not applicable to Postgres
+        if "sqlite_sequence" in sql:
+            class _Noop:
+                def fetchone(self): return None
+                def fetchall(self): return []
+            return _Noop()
+
+        # INSERT OR IGNORE was already replaced by _adapt_sql; add ON CONFLICT DO NOTHING
+        # if the original had INSERT OR IGNORE (now just INSERT INTO) and no ON CONFLICT yet
+        if "ON CONFLICT" not in sql and sql.lstrip().upper().startswith("INSERT INTO"):
+            # Only add when we're doing an INSERT that expects uniqueness handling.
+            # We do this conservatively: check if the original call came via executemany
+            # (which always passes through execute). Safe to add because our tables
+            # all have the right UNIQUE constraints and ON CONFLICT DO NOTHING is harmless.
+            sql = re.sub(r'(VALUES\s*\(.*?\))\s*$', r'\1 ON CONFLICT DO NOTHING', sql,
+                         flags=re.DOTALL | re.IGNORECASE)
+
+        cur = self._conn.cursor()
+        cur.execute(sql, params or ())
+        return _Cursor(cur)
+
+    def executemany(self, sql: str, params_seq):
+        sql = _adapt_sql(sql)
+        if "ON CONFLICT" not in sql and sql.lstrip().upper().startswith("INSERT INTO"):
+            sql = re.sub(r'(VALUES\s*\(.*?\))\s*$', r'\1 ON CONFLICT DO NOTHING', sql,
+                         flags=re.DOTALL | re.IGNORECASE)
+        cur = self._conn.cursor()
+        psycopg2.extras.execute_batch(cur, sql, params_seq, page_size=500)
+        return _Cursor(cur)
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        pass   # connection is pooled — never actually close it
+
+
+@st.cache_resource
+def _pg_pool():
+    """One persistent psycopg2 connection, reused across all Streamlit reruns."""
+    url = st.secrets["supabase"]["db_url"]
+    conn = psycopg2.connect(url)
+    conn.autocommit = False
+    return conn
+
+
+def get_connection() -> _Connection:
+    """Returns a wrapped connection. Auto-reconnects if the server closed it."""
+    try:
+        raw = _pg_pool()
+        raw.cursor().execute("SELECT 1")
+    except Exception:
+        _pg_pool.clear()
+        raw = _pg_pool()
+    return _Connection(raw)
+
 
 # ---------- AI enrichment config ----------
 OPENAI_MODEL = "gpt-5.2"
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
-AI_BATCH_SIZE = 20   # kept small so the model reliably returns every company in one response
+AI_BATCH_SIZE = 20
 AI_ELIGIBLE_MIN = 10
 AI_ELIGIBLE_MAX = 500
 
-def get_connection():
-    return sqlite3.connect(DB_FILE)
+
+
 
 def init_db():
     conn = get_connection()
@@ -132,6 +269,104 @@ def init_db():
     if "company_key" not in _prospects_cols:
         conn.execute("ALTER TABLE prospects ADD COLUMN company_key TEXT")
         conn.execute("UPDATE prospects SET company_key = LOWER(TRIM(company_name)) WHERE company_key IS NULL")
+
+    # ---------- Users table (per-person login + role) ----------
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'RA',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT
+        )
+    """)
+    conn.commit()
+
+    # One-time bootstrap: if no users exist yet, create the first Manager
+    # account from Streamlit secrets so there's always a way in. Set in
+    # secrets as:
+    #   [bootstrap_admin]
+    #   username = "vamsi"
+    #   password = "choose-a-strong-password"
+    #   display_name = "Vamsi"
+    _user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    if _user_count == 0:
+        boot = st.secrets.get("bootstrap_admin", {})
+        boot_user = boot.get("username", "").strip()
+        boot_pwd = boot.get("password", "")
+        boot_name = boot.get("display_name", boot_user).strip()
+        if boot_user and boot_pwd:
+            pwd_hash = bcrypt.hashpw(boot_pwd.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+            conn.execute(
+                "INSERT INTO users (username, password_hash, display_name, role, active, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (boot_user.lower(), pwd_hash, boot_name, "Manager", 1, date.today().isoformat())
+            )
+            conn.commit()
+
+    conn.close()
+
+# ---------- User / auth functions ----------
+
+def hash_password(raw_password):
+    return bcrypt.hashpw(raw_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+def verify_password(raw_password, password_hash):
+    try:
+        return bcrypt.checkpw(raw_password.encode("utf-8"), password_hash.encode("utf-8"))
+    except Exception:
+        return False
+
+def get_user_by_username(username):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT id, username, password_hash, display_name, role, active FROM users WHERE username = ?",
+        (username.strip().lower(),)
+    ).fetchone()
+    conn.close()
+    return row  # (id, username, password_hash, display_name, role, active) or None
+
+def list_users():
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id, username, display_name, role, active, created_at FROM users ORDER BY created_at, id"
+    ).fetchall()
+    conn.close()
+    return rows
+
+def create_user(username, raw_password, display_name, role):
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO users (username, password_hash, display_name, role, active, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (username.strip().lower(), hash_password(raw_password), display_name.strip(),
+             role, 1, date.today().isoformat())
+        )
+        conn.commit()
+        return True, "User created."
+    except Exception as e:
+        return False, f"Could not create user (username may already exist): {e}"
+    finally:
+        conn.close()
+
+def set_user_active(user_id, active):
+    conn = get_connection()
+    conn.execute("UPDATE users SET active = ? WHERE id = ?", (1 if active else 0, user_id))
+    conn.commit()
+    conn.close()
+
+def set_user_role(user_id, role):
+    conn = get_connection()
+    conn.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
+    conn.commit()
+    conn.close()
+
+def reset_user_password(user_id, new_raw_password):
+    conn = get_connection()
+    conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(new_raw_password), user_id))
     conn.commit()
     conn.close()
 
@@ -207,8 +442,8 @@ def add_keyword(keyword):
     try:
         conn.execute("INSERT INTO block_list (keyword) VALUES (?)", (keyword,))
         conn.commit()
-    except sqlite3.IntegrityError:
-        pass
+    except psycopg2.errors.UniqueViolation:
+        conn._conn.rollback()
     conn.close()
 
 def remove_keyword(keyword):
@@ -231,8 +466,8 @@ def add_to_clients(name):
     try:
         conn.execute("INSERT INTO clients (company_name) VALUES (?)", (name,))
         conn.commit()
-    except sqlite3.IntegrityError:
-        pass
+    except psycopg2.errors.UniqueViolation:
+        conn._conn.rollback()
     conn.close()
 
 def add_to_avoid(name, reason):
@@ -240,8 +475,8 @@ def add_to_avoid(name, reason):
     try:
         conn.execute("INSERT INTO avoid_list (company_name, reason) VALUES (?, ?)", (name, reason))
         conn.commit()
-    except sqlite3.IntegrityError:
-        pass
+    except psycopg2.errors.UniqueViolation:
+        conn._conn.rollback()
     conn.close()
 
 def bulk_add_clients(names):
@@ -312,8 +547,8 @@ def add_one_eligible(name, size, industry):
     try:
         conn.execute("INSERT INTO eligible_companies (company_name, employee_size, industry) VALUES (?, ?, ?)", (name, size, industry))
         conn.commit()
-    except sqlite3.IntegrityError:
-        pass
+    except psycopg2.errors.UniqueViolation:
+        conn._conn.rollback()
     conn.close()
 
 def add_one_not_eligible(name, size, industry, reason):
@@ -321,8 +556,8 @@ def add_one_not_eligible(name, size, industry, reason):
     try:
         conn.execute("INSERT INTO not_eligible_companies (company_name, employee_size, industry, reason) VALUES (?, ?, ?, ?)", (name, size, industry, reason))
         conn.commit()
-    except sqlite3.IntegrityError:
-        pass
+    except psycopg2.errors.UniqueViolation:
+        conn._conn.rollback()
     conn.close()
 
 def get_eligible_set():
@@ -386,8 +621,8 @@ def add_one_needs_review(name, size, industry, reason):
     try:
         conn.execute("INSERT INTO needs_review_companies (company_name, employee_size, industry, reason) VALUES (?, ?, ?, ?)", (name, size, industry, reason))
         conn.commit()
-    except sqlite3.IntegrityError:
-        pass
+    except psycopg2.errors.UniqueViolation:
+        conn._conn.rollback()
     conn.close()
 
 def get_needs_review_set():
@@ -448,10 +683,9 @@ def wipe_entire_database():
     # reset autoincrement counters so IDs start at 1 again on a fresh test run
     try:
         conn.execute("DELETE FROM sqlite_sequence")
-    except sqlite3.OperationalError:
+    except psycopg2.OperationalError:
         pass  # sqlite_sequence doesn't exist yet if nothing was ever inserted
     conn.commit()
-    conn.execute("VACUUM")
     conn.close()
 
 def guess_col(cols, target):
@@ -690,8 +924,8 @@ def add_title_bucket_keyword(keyword):
     try:
         conn.execute("INSERT INTO title_bucket_keywords (keyword) VALUES (?)", (keyword.strip(),))
         conn.commit()
-    except sqlite3.IntegrityError:
-        pass
+    except psycopg2.errors.UniqueViolation:
+        conn._conn.rollback()
     conn.close()
 
 def remove_title_bucket_keyword(keyword):
@@ -1329,7 +1563,65 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ---------- Login (per-user, role-based) ----------
+# First run: create your own Manager account via Streamlit secrets:
+#   [bootstrap_admin]
+#   username = "vamsi"
+#   password = "choose-a-strong-password"
+#   display_name = "Vamsi"
+# Everyone after that (TLs/RAs) is created from inside the app on the
+# "Manage users" page (Manager role only) — see create_user().
+def _check_auth():
+    if st.session_state.get("current_user"):
+        return True
+
+    init_db()  # must exist before we can look up users, even pre-login
+
+    st.markdown("""
+    <style>
+    .login-wrap { max-width:380px; margin:10vh auto 0; padding:2.4rem 2.2rem 2rem;
+        background:#16202E; border:1px solid #26333F; border-radius:14px; }
+    .login-title { font-family:'Space Grotesk',sans-serif; font-size:1.7rem; font-weight:700;
+        color:#E8EDF4; letter-spacing:-.02em; margin-bottom:.3rem; }
+    .login-sub { color:#8A9AAC; font-size:.88rem; margin-bottom:1.6rem; }
+    .dot { display:inline-block; width:8px; height:8px; border-radius:50%;
+        background:#0FA3B1; margin-left:4px; vertical-align:middle; }
+    </style>
+    <div class="login-wrap">
+        <div class="login-title">RA Workflow<span class="dot"></span></div>
+        <div class="login-sub">Sign in to continue.</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    uname = st.text_input("Username", key="login_username", placeholder="Username")
+    pwd = st.text_input("Password", type="password", key="login_pwd", placeholder="Password")
+
+    if st.button("Sign in", type="primary"):
+        user_row = get_user_by_username(uname) if uname.strip() else None
+        if user_row is None:
+            st.error("Incorrect username or password.")
+        else:
+            user_id, username, pwd_hash, display_name, role, active = user_row
+            if not active:
+                st.error("This account has been deactivated. Contact your manager.")
+            elif not verify_password(pwd, pwd_hash):
+                st.error("Incorrect username or password.")
+            else:
+                st.session_state.current_user = {
+                    "id": user_id, "username": username,
+                    "display_name": display_name, "role": role,
+                }
+                st.rerun()
+    return False
+
+if not _check_auth():
+    st.stop()
+
 init_db()
+
+CURRENT_USER = st.session_state.current_user
+CURRENT_ROLE = CURRENT_USER["role"]          # "Manager" | "TL" | "RA"
+CURRENT_NAME = CURRENT_USER["display_name"]
 
 if "openai_api_key" not in st.session_state:
     st.session_state.openai_api_key = get_setting("openai_api_key", "")
@@ -1622,10 +1914,21 @@ NAV = [
     ("Settings", [("Clients & DNC", "Clients & DNC"), ("Title block list", "Title block list"),
                   ("Danger zone", "Danger zone")]),
 ]
+# Manager-only section — user accounts
+if CURRENT_ROLE == "Manager":
+    NAV.append(("Admin", [("Manage users", "Manage users")]))
 
 with st.sidebar:
     st.markdown('<div class="brand"><span class="brand-mark">RA Workflow</span>'
                 '<span class="brand-dot"></span></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="padding:.5rem .2rem 1rem; font-size:.85rem;">'
+        f'Signed in as <b>{CURRENT_NAME}</b><br><span style="opacity:.7;">{CURRENT_ROLE}</span></div>',
+        unsafe_allow_html=True
+    )
+    if st.button("Log out", key="logout_btn"):
+        del st.session_state["current_user"]
+        st.rerun()
 
     for group, items in NAV:
         st.markdown(f'<div class="nav-group">{group}</div>', unsafe_allow_html=True)
@@ -1738,6 +2041,7 @@ def page_dashboard():
 def page_add():
     page_header("Pipeline", "Add a company",
                 "For a single company an RA found by hand — checked against clients, DNC and the 30-day duplicate window before it saves.")
+    st.session_state.setdefault("ra_name", CURRENT_NAME)
     st.text_input("Your name (the RA adding this)", key="ra_name")
     st.text_input("Company name (exact LinkedIn name)", key="company_input")
     st.text_input("Position", key="position_input")
@@ -2460,6 +2764,7 @@ def page_eod():
     st.write(f"**{count_eod():,}** EOD rows on file across **{len(get_eod_ra_list()):,}** RA(s).")
 
     st.subheader("Upload your EOD sheet")
+    st.session_state.setdefault("eod_ra_name", CURRENT_NAME)
     eod_ra_name = st.text_input("Your name (RA)", key="eod_ra_name")
     eod_date = st.date_input("Date", value=date.today(), key="eod_date")
     eod_file = st.file_uploader(
@@ -2740,6 +3045,79 @@ def page_danger():
             st.error('Type WIPE exactly (all caps) in the box above, then click the button again.')
 
 
+def page_users():
+    page_header("Admin", "Manage users", "Create logins for TLs and RAs, set roles, deactivate access.")
+
+    if CURRENT_ROLE != "Manager":
+        st.error("Only a Manager can access this page.")
+        return
+
+    st.markdown("#### Add a new user")
+    with st.form("new_user_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            new_username = st.text_input("Username (used to log in)")
+            new_display = st.text_input("Display name")
+        with c2:
+            new_role = st.selectbox("Role", ["RA", "TL", "Manager"])
+            new_pwd = st.text_input("Temporary password", type="password")
+        submitted = st.form_submit_button("Create user", type="primary")
+        if submitted:
+            if not new_username.strip() or not new_pwd or not new_display.strip():
+                st.error("Username, display name, and password are all required.")
+            elif len(new_pwd) < 6:
+                st.error("Password should be at least 6 characters.")
+            else:
+                ok, msg = create_user(new_username, new_pwd, new_display, new_role)
+                if ok:
+                    st.success(f"Created {new_role} account for {new_display} (username: {new_username.strip().lower()}). "
+                               f"Share the temporary password with them directly — it won't be shown again here.")
+                else:
+                    st.error(msg)
+
+    st.markdown("#### Existing users")
+    users = list_users()
+    if not users:
+        st.caption("No users yet.")
+        return
+
+    for uid, username, display_name, role, active, created_at in users:
+        with st.container(border=True):
+            c1, c2, c3, c4, c5 = st.columns([2.2, 1.3, 1.3, 1.3, 1.3])
+            c1.markdown(f"**{display_name}**  \n`{username}`")
+            c2.caption(f"Role\n\n**{role}**")
+            c3.caption(f"Status\n\n**{'Active' if active else 'Deactivated'}**")
+
+            is_self = (uid == CURRENT_USER["id"])
+            with c4:
+                if is_self:
+                    st.caption("This is you")
+                elif active:
+                    if st.button("Deactivate", key=f"deact_{uid}"):
+                        set_user_active(uid, False)
+                        st.rerun()
+                else:
+                    if st.button("Reactivate", key=f"react_{uid}"):
+                        set_user_active(uid, True)
+                        st.rerun()
+            with c5:
+                new_role_pick = st.selectbox("Change role", ["RA", "TL", "Manager"],
+                                              index=["RA", "TL", "Manager"].index(role),
+                                              key=f"role_{uid}", label_visibility="collapsed")
+                if new_role_pick != role:
+                    set_user_role(uid, new_role_pick)
+                    st.rerun()
+
+            with st.expander("Reset password"):
+                rp = st.text_input("New password", type="password", key=f"resetpwd_{uid}")
+                if st.button("Set new password", key=f"resetbtn_{uid}"):
+                    if len(rp) < 6:
+                        st.error("Password should be at least 6 characters.")
+                    else:
+                        reset_user_password(uid, rp)
+                        st.success("Password updated.")
+
+
 # ---------- Router ----------
 ROUTES = {
     "Dashboard": page_dashboard,
@@ -2755,6 +3133,7 @@ ROUTES = {
     "Clients & DNC": page_lists,
     "Title block list": page_block,
     "Danger zone": page_danger,
+    "Manage users": page_users,
 }
 
 ROUTES.get(st.session_state.page, page_dashboard)()
