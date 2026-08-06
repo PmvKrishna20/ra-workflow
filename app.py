@@ -324,14 +324,6 @@ def init_db():
             updated_at TEXT
         )
     """)
-    # Enforce "one ACTIVE position per company" at the database level.
-    # A closed position doesn't block a fresh one being opened later.
-    conn.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_one_active_per_company
-        ON positions (company_name) WHERE status <> 'Closed'
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_assigned_ra ON positions(assigned_ra)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_batch ON positions(batch_id)")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS position_prospects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -349,10 +341,11 @@ def init_db():
             updated_at TEXT
         )
     """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_position_prospects_position ON position_prospects(position_id)")
+    conn.commit()
 
     # Migrate columns added after the tables first went live (CREATE TABLE IF NOT EXISTS
     # above won't add columns to a table that already exists from an earlier deploy).
+    # This MUST run before any index below that references these columns.
     _pos_cols = [r[1] for r in conn.execute("PRAGMA table_info(positions)").fetchall()]
     if "batch_id" not in _pos_cols:
         conn.execute("ALTER TABLE positions ADD COLUMN batch_id TEXT")
@@ -360,7 +353,17 @@ def init_db():
     for _col in ("full_name", "location", "linkedin_url"):
         if _col not in _pp_cols:
             conn.execute(f"ALTER TABLE position_prospects ADD COLUMN {_col} TEXT")
+    conn.commit()
 
+    # Enforce "one ACTIVE position per company" at the database level.
+    # A closed position doesn't block a fresh one being opened later.
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_one_active_per_company
+        ON positions (company_name) WHERE status <> 'Closed'
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_assigned_ra ON positions(assigned_ra)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_batch ON positions(batch_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_position_prospects_position ON position_prospects(position_id)")
     conn.commit()
 
     conn.close()
