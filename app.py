@@ -314,6 +314,9 @@ def init_db():
                 expires_at TEXT NOT NULL
             )
         """)
+    # URL-carried bearer sessions were removed because copied links transferred
+    # the signed-in user's privileges. Invalidate every legacy token on upgrade.
+    conn.execute("DELETE FROM sessions")
     conn.commit()
 
     # One-time bootstrap: if no users exist yet, create the first Manager
@@ -1215,7 +1218,8 @@ def review_not_eligible_request(request_id, approve, reviewer, decision_note="")
 def get_active_ra_names():
     conn = get_connection()
     rows = conn.execute(
-        "SELECT display_name FROM users WHERE active = 1 AND role = 'RA' ORDER BY display_name"
+        "SELECT display_name FROM users WHERE active = 1 "
+        "AND role IN ('RA', 'TL', 'Manager') ORDER BY display_name"
     ).fetchall()
     conn.close()
     return [r[0] for r in rows]
@@ -2579,18 +2583,6 @@ def _check_auth():
 
     init_db()  # must exist before we can look up users, even pre-login
 
-    # Restore identity after a browser refresh. Only a hash of this short-lived
-    # token is stored in Postgres, and logout/deactivation/role changes revoke it.
-    session_token = st.query_params.get("session", "")
-    restored = get_user_by_session_token(session_token)
-    if restored:
-        user_id, username, display_name, role = restored
-        st.session_state.current_user = {
-            "id": user_id, "username": username,
-            "display_name": display_name, "role": role,
-        }
-        return True
-
     st.markdown("""
     <style>
     .login-wrap { max-width:380px; margin:10vh auto 0; padding:2.4rem 2.2rem 2rem;
@@ -2625,7 +2617,6 @@ def _check_auth():
                     "id": user_id, "username": username,
                     "display_name": display_name, "role": role,
                 }
-                st.query_params["session"] = create_session_token(user_id)
                 st.rerun()
     return False
 
@@ -2638,9 +2629,6 @@ init_db()
 # effect immediately instead of lingering in an old Streamlit session.
 _fresh_user = get_current_user_record(st.session_state.current_user["id"])
 if not _fresh_user or not _fresh_user[4]:
-    _stale_token = st.query_params.get("session", "")
-    delete_session_token(_stale_token)
-    st.query_params.pop("session", None)
     st.session_state.pop("current_user", None)
     st.rerun()
 st.session_state.current_user = {
@@ -2989,8 +2977,6 @@ with st.sidebar:
 
     st.markdown('<div class="nav-group">Account</div>', unsafe_allow_html=True)
     if st.button("Log out", key="logout_btn"):
-        delete_session_token(st.query_params.get("session", ""))
-        st.query_params.pop("session", None)
         st.session_state.pop("current_user", None)
         st.rerun()
 
@@ -3088,9 +3074,9 @@ def page_add():
     page_header("Pipeline", "Add a company",
                 "For a single company an RA found by hand — checked against clients, DNC and the 30-day duplicate window before it saves.")
     if CURRENT_ROLE == "RA":
-        st.text_input("Assigned RA", value=CURRENT_NAME, disabled=True, key="manual_ra_display")
+        st.text_input("Assigned to", value=CURRENT_NAME, disabled=True, key="manual_ra_display")
     else:
-        st.selectbox("Assign to RA", get_active_ra_names(), key="manual_target_ra")
+        st.selectbox("Assign to RA / TL / Manager", get_active_ra_names(), key="manual_target_ra")
     st.text_input("Company name (exact LinkedIn name)", key="company_input")
     st.text_input("Position", key="position_input")
     st.button("Add company", on_click=handle_add_company)
@@ -3399,11 +3385,11 @@ def page_bulk():
                        "(already assigned in an earlier batch) — excluded here to prevent double-assignment.")
 
         if assignment_pool:
-            roster_df = pd.DataFrame({"RA Name": [""], "Count": [0]})
+            roster_df = pd.DataFrame({"Assignee": [""], "Count": [0]})
             edited_roster = st.data_editor(
                 roster_df, num_rows="dynamic", key="ra_roster_editor", hide_index=True,
                 column_config={
-                    "RA Name": st.column_config.SelectboxColumn(options=get_active_ra_names(), required=True),
+                    "Assignee": st.column_config.SelectboxColumn(options=get_active_ra_names(), required=True),
                     "Count": st.column_config.NumberColumn(min_value=0, step=1),
                 },
             )
@@ -3420,9 +3406,9 @@ def page_bulk():
 
             if st.button("Deal out to RAs", disabled=(total_assigned == 0)):
                 roster = [
-                    (str(row["RA Name"]).strip(), int(row["Count"]))
+                    (str(row["Assignee"]).strip(), int(row["Count"]))
                     for _, row in edited_roster.iterrows()
-                    if str(row["RA Name"]).strip() and pd.notna(row["Count"]) and int(row["Count"]) > 0
+                    if str(row["Assignee"]).strip() and pd.notna(row["Count"]) and int(row["Count"]) > 0
                 ]
                 if not roster:
                     st.error("Enter at least one RA name with a count greater than 0.")
@@ -3854,20 +3840,20 @@ def page_assignments():
     queue_rows = get_reassignment_queue_rows()
     if queue_rows:
         queue_df = pd.DataFrame(queue_rows, columns=["Company Name", "Job Title", "Location", "Job URL"])
-        queue_df["Assign to RA"] = ""
+        queue_df["Assign to"] = ""
         edited_queue = st.data_editor(
             queue_df, hide_index=True, disabled=["Company Name", "Job Title", "Location", "Job URL"],
             column_config={
-                "Assign to RA": st.column_config.SelectboxColumn(options=[""] + get_active_ra_names())
+                "Assign to": st.column_config.SelectboxColumn(options=[""] + get_active_ra_names())
             }, key="reassignment_editor", **FULL
         )
-        selected = edited_queue[edited_queue["Assign to RA"].astype(str).str.strip() != ""]
+        selected = edited_queue[edited_queue["Assign to"].astype(str).str.strip() != ""]
         if st.button("Assign selected queued companies", disabled=selected.empty):
             batch_id = uuid.uuid4().hex[:10]
             assigned_date = date.today().isoformat()
             rows_to_save = [
                 (batch_id, row["Company Name"], row["Job Title"], row["Location"], row["Job URL"],
-                 row["Assign to RA"], assigned_date)
+                 row["Assign to"], assigned_date)
                 for _, row in selected.iterrows()
             ]
             created = save_assignment_bundle(rows_to_save, CURRENT_NAME)
@@ -3950,10 +3936,10 @@ def page_workpage():
         if is_overseer and can_edit:
             active_ras = get_active_ra_names()
             ra_options = active_ras if assigned_ra in active_ras else [assigned_ra] + active_ras
-            new_ra = st.selectbox("Assigned RA", ra_options, index=ra_options.index(assigned_ra), key=f"wp_ra_{pid}")
+            new_ra = st.selectbox("Assigned to", ra_options, index=ra_options.index(assigned_ra), key=f"wp_ra_{pid}")
         else:
             new_ra = assigned_ra
-            st.text_input("Assigned RA", value=assigned_ra or "", disabled=True, key=f"wp_ra_ro_{pid}")
+            st.text_input("Assigned to", value=assigned_ra or "", disabled=True, key=f"wp_ra_ro_{pid}")
         new_url = st.text_input("JD URL", value=job_url or "", disabled=not can_edit, key=f"wp_url_{pid}")
     if job_url:
         st.markdown(f"[Open job posting ↗]({job_url})")
@@ -4242,7 +4228,7 @@ def _campaign_dataframe(items):
 
 def page_campaign_export():
     page_header("Campaign", "Campaign export",
-                "RA-wise Ready totals, campaign-ready downloads, and immutable export history.")
+                "Assignee-wise Ready totals, campaign-ready downloads, and immutable export history.")
     if CURRENT_ROLE not in ("Manager", "TL"):
         st.error("Only a TL or Manager can access campaign exports.")
         return
@@ -4253,16 +4239,16 @@ def page_campaign_export():
     with f2:
         date_to = st.date_input("To Work Date", value=date.today(), key="campaign_to")
     with f3:
-        ra_filter = st.selectbox("RA", ["All"] + get_ra_names_with_positions(), key="campaign_ra")
+        ra_filter = st.selectbox("Assignee", ["All"] + get_ra_names_with_positions(), key="campaign_ra")
 
     totals = get_ra_ready_totals(date_from.isoformat(), date_to.isoformat())
-    totals_df = pd.DataFrame(totals, columns=["Work Date", "RA", "Positions Ready", "Prospects"])
-    st.markdown("#### Daily RA totals")
+    totals_df = pd.DataFrame(totals, columns=["Work Date", "Assignee", "Positions Ready", "Prospects"])
+    st.markdown("#### Daily assignee totals")
     if totals_df.empty:
         st.info("No Ready or Exported work for this date range.")
     else:
         st.dataframe(totals_df, hide_index=True, **FULL)
-        st.download_button("Download RA totals", totals_df.to_csv(index=False),
+        st.download_button("Download assignee totals", totals_df.to_csv(index=False),
                            "ra_daily_totals.csv", "text/csv")
 
     st.markdown("#### Ready positions")
