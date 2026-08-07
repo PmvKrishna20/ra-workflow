@@ -5,9 +5,11 @@ import re
 import json
 import uuid
 import bcrypt
+import hashlib
+import secrets as secure_secrets
 import urllib.request
 import urllib.error
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 # ---------------------------------------------------------------------------
 # Database adapter — wraps psycopg2 (Supabase/PostgreSQL) behind the same
@@ -30,6 +32,7 @@ from datetime import date, timedelta
 import psycopg2
 import psycopg2.extensions
 import psycopg2.extras
+import psycopg2.pool
 
 
 def _adapt_sql(sql: str) -> str:
@@ -67,8 +70,10 @@ class _Cursor:
 class _Connection:
     """Wraps a psycopg2 connection with the sqlite3-like execute/executemany/commit/close API."""
 
-    def __init__(self, pg_conn):
+    def __init__(self, pg_conn, pool):
         self._conn = pg_conn
+        self._pool = pool
+        self._returned = False
 
     def execute(self, sql: str, params=None):
         sql = _adapt_sql(sql)
@@ -126,27 +131,30 @@ class _Connection:
         self._conn.commit()
 
     def close(self):
-        pass   # connection is pooled — never actually close it
+        if self._returned:
+            return
+        if self._conn.get_transaction_status() != psycopg2.extensions.TRANSACTION_STATUS_IDLE:
+            self._conn.rollback()
+        self._pool.putconn(self._conn)
+        self._returned = True
 
 
 @st.cache_resource
 def _pg_pool():
-    """One persistent psycopg2 connection, reused across all Streamlit reruns."""
+    """Thread-safe pool so concurrent user sessions never share a transaction."""
     url = st.secrets["supabase"]["db_url"]
-    conn = psycopg2.connect(url)
-    conn.autocommit = False
-    return conn
+    return psycopg2.pool.ThreadedConnectionPool(1, 10, dsn=url)
 
 
 def get_connection() -> _Connection:
-    """Returns a wrapped connection. Auto-reconnects if the server closed it."""
-    try:
-        raw = _pg_pool()
-        raw.cursor().execute("SELECT 1")
-    except Exception:
-        _pg_pool.clear()
-        raw = _pg_pool()
-    return _Connection(raw)
+    """Borrow a connection without a network round-trip health check."""
+    pool = _pg_pool()
+    raw = pool.getconn()
+    if raw.closed:
+        pool.putconn(raw, close=True)
+        raw = pool.getconn()
+    raw.autocommit = False
+    return _Connection(raw, pool)
 
 
 # ---------- AI enrichment config ----------
@@ -159,6 +167,7 @@ AI_ELIGIBLE_MAX = 500
 
 
 
+@st.cache_resource
 def init_db():
     conn = get_connection()
     conn.execute("""
@@ -269,7 +278,7 @@ def init_db():
     _prospects_cols = [r[1] for r in conn.execute("PRAGMA table_info(prospects)").fetchall()]
     if "company_key" not in _prospects_cols:
         conn.execute("ALTER TABLE prospects ADD COLUMN company_key TEXT")
-        conn.execute("UPDATE prospects SET company_key = LOWER(TRIM(company_name)) WHERE company_key IS NULL")
+    conn.execute("UPDATE prospects SET company_key = company_name WHERE company_key IS DISTINCT FROM company_name")
 
     # ---------- Users table (per-person login + role) ----------
     conn.execute("""
@@ -280,9 +289,31 @@ def init_db():
             display_name TEXT NOT NULL,
             role TEXT NOT NULL DEFAULT 'RA',
             active INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT
+            created_at TEXT,
+            work_date_preference TEXT
         )
     """)
+    conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS work_date_preference TEXT")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            token_hash TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )
+    """)
+    _session_cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
+    if "token_hash" not in _session_cols or "expires_at" not in _session_cols:
+        # An earlier unfinished build created an unused incompatible sessions table.
+        conn.execute("DROP TABLE sessions")
+        conn.execute("""
+            CREATE TABLE sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )
+        """)
     conn.commit()
 
     # One-time bootstrap: if no users exist yet, create the first Manager
@@ -349,6 +380,36 @@ def init_db():
     _pos_cols = [r[1] for r in conn.execute("PRAGMA table_info(positions)").fetchall()]
     if "batch_id" not in _pos_cols:
         conn.execute("ALTER TABLE positions ADD COLUMN batch_id TEXT")
+    for _col, _type in (
+        ("master_company_id", "INTEGER"), ("ready_work_date", "TEXT"),
+        ("ready_at", "TEXT"), ("ready_by", "TEXT"),
+        ("export_batch_id", "TEXT"), ("exported_at", "TEXT"),
+        ("exported_by", "TEXT"),
+    ):
+        if _col not in _pos_cols:
+            conn.execute(f"ALTER TABLE positions ADD COLUMN {_col} {_type}")
+    conn.execute("""
+        UPDATE positions p
+        SET master_company_id = (
+            SELECT c.id FROM companies c
+            WHERE c.company_name = p.company_name
+              AND c.added_by = p.assigned_ra
+              AND c.date_added = p.created_at
+            ORDER BY c.id DESC LIMIT 1
+        )
+        WHERE p.master_company_id IS NULL
+    """)
+    _orphan_positions = conn.execute(
+        "SELECT id, company_name, job_title, assigned_ra, created_at, source "
+        "FROM positions WHERE master_company_id IS NULL"
+    ).fetchall()
+    for _pid, _company, _title, _ra, _created, _source in _orphan_positions:
+        _master_id = conn.execute(
+            "INSERT INTO companies (company_name, position, added_by, date_added, source) "
+            "VALUES (?, ?, ?, ?, ?) RETURNING id",
+            (_company, _title, _ra, _created or date.today().isoformat(), _source or "workpage_migration")
+        ).fetchone()[0]
+        conn.execute("UPDATE positions SET master_company_id = ? WHERE id = ?", (_master_id, _pid))
     _pp_cols = [r[1] for r in conn.execute("PRAGMA table_info(position_prospects)").fetchall()]
     for _col in ("full_name", "location", "linkedin_url"):
         if _col not in _pp_cols:
@@ -357,13 +418,93 @@ def init_db():
 
     # Enforce "one ACTIVE position per company" at the database level.
     # A closed position doesn't block a fresh one being opened later.
+    # The old Closed state meant "sent to campaign" and maps to Exported.
+    conn.execute("UPDATE positions SET status = 'Exported' WHERE status = 'Closed'")
+    conn.execute("DROP INDEX IF EXISTS idx_positions_one_active_per_company")
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_one_active_per_company
-        ON positions (company_name) WHERE status <> 'Closed'
+        ON positions (company_name) WHERE status <> 'Exported'
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_assigned_ra ON positions(assigned_ra)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_batch ON positions(batch_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_position_prospects_position ON position_prospects(position_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_ready_work_date ON positions(ready_work_date)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS not_eligible_requests (
+            id SERIAL PRIMARY KEY,
+            company_name TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            requested_by TEXT NOT NULL,
+            requested_by_user_id INTEGER,
+            requested_at TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'Pending',
+            reviewed_by TEXT,
+            reviewed_at TEXT,
+            decision_note TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS reassignment_queue (
+            id SERIAL PRIMARY KEY,
+            company_name TEXT NOT NULL UNIQUE,
+            job_title TEXT,
+            location TEXT,
+            job_url TEXT,
+            source_reason TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS deletion_audit (
+            id SERIAL PRIMARY KEY,
+            position_id INTEGER,
+            company_name TEXT NOT NULL,
+            position_snapshot_json TEXT NOT NULL,
+            prospects_snapshot_json TEXT NOT NULL,
+            export_batch_id TEXT,
+            deleted_by TEXT NOT NULL,
+            deleted_by_role TEXT NOT NULL,
+            deletion_reason TEXT NOT NULL,
+            deleted_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS export_batches (
+            batch_id TEXT PRIMARY KEY,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            position_count INTEGER NOT NULL,
+            prospect_count INTEGER NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS export_batch_items (
+            id SERIAL PRIMARY KEY,
+            batch_id TEXT NOT NULL,
+            position_id INTEGER NOT NULL,
+            company_name TEXT NOT NULL,
+            ra_name TEXT,
+            work_date TEXT,
+            first_name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            job_position TEXT NOT NULL,
+            job_location TEXT NOT NULL,
+            prospect_snapshot_json TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_export_items_batch ON export_batch_items(batch_id)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id SERIAL PRIMARY KEY,
+            action TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_id TEXT,
+            actor TEXT NOT NULL,
+            details_json TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
     conn.commit()
 
     conn.close()
@@ -378,6 +519,74 @@ def verify_password(raw_password, password_hash):
         return bcrypt.checkpw(raw_password.encode("utf-8"), password_hash.encode("utf-8"))
     except Exception:
         return False
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def audit_event(action, entity_type, entity_id, actor, details=None, conn=None):
+    own_conn = conn is None
+    conn = conn or get_connection()
+    conn.execute(
+        "INSERT INTO audit_log (action, entity_type, entity_id, actor, details_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (action, entity_type, str(entity_id) if entity_id is not None else None,
+         actor, json.dumps(details or {}, default=str), utc_now_iso())
+    )
+    if own_conn:
+        conn.commit()
+        conn.close()
+
+def _token_hash(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+def create_session_token(user_id):
+    token = secure_secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    conn = get_connection()
+    conn.execute("DELETE FROM sessions WHERE expires_at < ?", (now.isoformat(),))
+    conn.execute(
+        "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+        (_token_hash(token), user_id, now.isoformat(), (now + timedelta(days=7)).isoformat())
+    )
+    conn.commit()
+    conn.close()
+    return token
+
+def get_user_by_session_token(token):
+    if not token:
+        return None
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT u.id, u.username, u.display_name, u.role FROM sessions s "
+        "JOIN users u ON u.id = s.user_id "
+        "WHERE s.token_hash = ? AND s.expires_at >= ? AND u.active = 1",
+        (_token_hash(token), utc_now_iso())
+    ).fetchone()
+    conn.close()
+    return row
+
+def delete_session_token(token):
+    if not token:
+        return
+    conn = get_connection()
+    conn.execute("DELETE FROM sessions WHERE token_hash = ?", (_token_hash(token),))
+    conn.commit()
+    conn.close()
+
+def revoke_user_sessions(user_id):
+    conn = get_connection()
+    conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def get_current_user_record(user_id):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT id, username, display_name, role, active, work_date_preference FROM users WHERE id = ?",
+        (user_id,)
+    ).fetchone()
+    conn.close()
+    return row
 
 def get_user_by_username(username):
     conn = get_connection()
@@ -403,6 +612,10 @@ def create_user(username, raw_password, display_name, role):
     if existing:
         conn.close()
         return False, "That username is already taken."
+    existing_name = conn.execute("SELECT id FROM users WHERE display_name = ?", (display_name.strip(),)).fetchone()
+    if existing_name:
+        conn.close()
+        return False, "That display name is already in use. Display names must be unique for assignment ownership."
     conn.execute(
         "INSERT INTO users (username, password_hash, display_name, role, active, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?)",
@@ -417,16 +630,41 @@ def set_user_active(user_id, active):
     conn.execute("UPDATE users SET active = ? WHERE id = ?", (1 if active else 0, user_id))
     conn.commit()
     conn.close()
+    revoke_user_sessions(user_id)
 
 def set_user_role(user_id, role):
     conn = get_connection()
     conn.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
     conn.commit()
     conn.close()
+    revoke_user_sessions(user_id)
 
 def reset_user_password(user_id, new_raw_password):
     conn = get_connection()
     conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(new_raw_password), user_id))
+    conn.commit()
+    conn.close()
+    revoke_user_sessions(user_id)
+
+def get_user_work_date(user_id):
+    row = get_current_user_record(user_id)
+    raw = row[5] if row else None
+    if not raw and row:
+        conn = get_connection()
+        previous = conn.execute(
+            "SELECT ready_work_date FROM positions WHERE assigned_ra = ? AND ready_work_date IS NOT NULL "
+            "ORDER BY ready_at DESC NULLS LAST, id DESC LIMIT 1", (row[2],)
+        ).fetchone()
+        conn.close()
+        raw = previous[0] if previous else None
+    try:
+        return date.fromisoformat(raw) if raw else date.today()
+    except ValueError:
+        return date.today()
+
+def set_user_work_date(user_id, work_date):
+    conn = get_connection()
+    conn.execute("UPDATE users SET work_date_preference = ? WHERE id = ?", (work_date.isoformat(), user_id))
     conn.commit()
     conn.close()
 
@@ -444,59 +682,124 @@ def find_recent_duplicate(company_name):
 
 def add_company(company_name, position, added_by):
     conn = get_connection()
-    conn.execute(
-        "INSERT INTO companies (company_name, position, added_by, date_added, source) VALUES (?, ?, ?, ?, ?)",
+    row = conn.execute(
+        "INSERT INTO companies (company_name, position, added_by, date_added, source) "
+        "VALUES (?, ?, ?, ?, ?) RETURNING id",
         (company_name, position, added_by, date.today().isoformat(), "manual")
-    )
+    ).fetchone()
     conn.commit()
     conn.close()
+    return row[0]
 
 # ---------- Workpage: positions + prospects ----------
 
-def create_position(company_name, job_title, assigned_ra, source, created_by, location="", job_url="", batch_id=None):
+def create_position(company_name, job_title, assigned_ra, source, created_by, location="", job_url="", batch_id=None,
+                    master_company_id=None):
     """Creates a new active position for a company. Returns False without creating
-    anything if that company already has an active (non-Closed) position. The
+    anything if that company already has an active (non-Exported) position. The
     partial unique index on positions is still there as a safety net for the rare
     case of two people saving at the same instant — the adapter auto-appends
     ON CONFLICT DO NOTHING to inserts, so a race just silently no-ops rather than
     erroring."""
     conn = get_connection()
     existing = conn.execute(
-        "SELECT id FROM positions WHERE company_name = ? AND status <> 'Closed'", (company_name,)
+        "SELECT id FROM positions WHERE company_name = ? AND status <> 'Exported'", (company_name,)
     ).fetchone()
     if existing:
         conn.close()
         return False
     now = date.today().isoformat()
-    conn.execute(
+    inserted = conn.execute(
         "INSERT INTO positions (company_name, job_title, status, assigned_ra, source, batch_id, "
-        "location, job_url, created_by, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "location, job_url, created_by, created_at, updated_at, master_company_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         (company_name, job_title, "Open", assigned_ra, source, batch_id, location, job_url,
-         created_by, now, now)
-    )
+         created_by, now, now, master_company_id)
+    ).fetchone()
     conn.commit()
     conn.close()
-    return True
+    return inserted[0] if inserted else False
+
+def create_manual_company_position(company_name, job_title, assigned_ra, created_by, location="", job_url=""):
+    """Create the Master row and Workpage position atomically."""
+    conn = get_connection()
+    try:
+        existing = conn.execute(
+            "SELECT id FROM positions WHERE company_name = ? AND status <> 'Exported'", (company_name,)
+        ).fetchone()
+        if existing:
+            conn.close()
+            return False
+        now = date.today().isoformat()
+        master_id = conn.execute(
+            "INSERT INTO companies (company_name, position, added_by, date_added, source) "
+            "VALUES (?, ?, ?, ?, 'manual') RETURNING id",
+            (company_name, job_title, assigned_ra, now)
+        ).fetchone()[0]
+        position_id = conn.execute(
+            "INSERT INTO positions (company_name, job_title, status, assigned_ra, source, location, job_url, "
+            "created_by, created_at, updated_at, master_company_id) "
+            "VALUES (?, ?, 'Open', ?, 'manual', ?, ?, ?, ?, ?, ?) RETURNING id",
+            (company_name, job_title, assigned_ra, location, job_url, created_by, now, now, master_id)
+        ).fetchone()[0]
+        audit_event("create", "position", position_id, created_by, {"source": "manual"}, conn)
+        conn.commit()
+        conn.close()
+        return position_id
+    except Exception:
+        conn._conn.rollback()
+        conn.close()
+        raise
 
 def get_companies_with_active_position():
-    """Companies that currently have an open (non-Closed) position — used to keep the
+    """Companies that currently have an active (non-Exported) position — used to keep the
     RA Assignment pool from offering the same company twice across separate batches."""
     conn = get_connection()
-    rows = conn.execute("SELECT company_name FROM positions WHERE status <> 'Closed'").fetchall()
+    rows = conn.execute(
+        "SELECT company_name FROM positions WHERE status <> 'Exported' "
+        "UNION SELECT company_name FROM not_eligible_requests WHERE status = 'Pending'"
+    ).fetchall()
     conn.close()
     return set(r[0] for r in rows)
 
-def bulk_create_positions_from_assignments(rows):
-    """rows: (batch_id, company_name, job_title, location, job_url, ra_name, assigned_date) —
-    same shape bulk_insert_assignments takes. Creates a matching position for each company
-    that doesn't already have an active one; skips the rest quietly."""
+def save_assignment_bundle(rows, actor):
+    """Save assignment, Master entry, and Workpage position atomically."""
+    conn = get_connection()
     created = 0
-    for batch_id, company, title, location, url, ra_name, assigned_date in rows:
-        ok = create_position(company, title, ra_name, "auto_assigned", "RA Assignments", location, url, batch_id)
-        if ok:
+    try:
+        for batch_id, company, title, location, url, ra_name, assigned_date in rows:
+            existing = conn.execute(
+                "SELECT id FROM positions WHERE company_name = ? AND status <> 'Exported'", (company,)
+            ).fetchone()
+            if existing:
+                continue
+            master_id = conn.execute(
+                "INSERT INTO companies (company_name, position, added_by, date_added, source) "
+                "VALUES (?, ?, ?, ?, 'auto_assigned') RETURNING id",
+                (company, title, ra_name, assigned_date)
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO ra_assignments (batch_id, company_name, job_title, location, job_url, ra_name, assigned_date) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (batch_id, company, title, location, url, ra_name, assigned_date)
+            )
+            pid = conn.execute(
+                "INSERT INTO positions (company_name, job_title, status, assigned_ra, source, batch_id, location, "
+                "job_url, created_by, created_at, updated_at, master_company_id) "
+                "VALUES (?, ?, 'Open', ?, 'auto_assigned', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                (company, title, ra_name, batch_id, location, url, actor,
+                 assigned_date, assigned_date, master_id)
+            ).fetchone()[0]
+            audit_event("assign", "position", pid, actor, {"assigned_ra": ra_name, "batch_id": batch_id}, conn)
+            conn.execute("DELETE FROM reassignment_queue WHERE company_name = ?", (company,))
             created += 1
-    return created
+        conn.commit()
+        conn.close()
+        return created
+    except Exception:
+        conn._conn.rollback()
+        conn.close()
+        raise
 
 def delete_positions_for_batch(batch_id):
     """Removes the ra_assignments rows for a batch, plus any position that batch created
@@ -505,20 +808,23 @@ def delete_positions_for_batch(batch_id):
     are left alone so real work is never silently deleted; returns how many of each."""
     conn = get_connection()
     candidates = conn.execute(
-        "SELECT id FROM positions WHERE batch_id = ? AND status = 'Open'", (batch_id,)
+        "SELECT id, master_company_id, company_name FROM positions WHERE batch_id = ? AND status = 'Open'", (batch_id,)
     ).fetchall()
     deleted_positions = 0
     kept_positions = 0
-    for (pid,) in candidates:
+    for pid, master_id, company_name in candidates:
         n_prospects = conn.execute(
             "SELECT COUNT(*) FROM position_prospects WHERE position_id = ?", (pid,)
         ).fetchone()[0]
         if n_prospects == 0:
             conn.execute("DELETE FROM positions WHERE id = ?", (pid,))
+            if master_id:
+                conn.execute("DELETE FROM companies WHERE id = ?", (master_id,))
+            conn.execute("DELETE FROM ra_assignments WHERE batch_id = ? AND company_name = ?",
+                         (batch_id, company_name))
             deleted_positions += 1
         else:
             kept_positions += 1
-    conn.execute("DELETE FROM ra_assignments WHERE batch_id = ?", (batch_id,))
     conn.commit()
     conn.close()
     return deleted_positions, kept_positions
@@ -533,7 +839,7 @@ def get_positions_for_ra(ra_name, include_closed=False):
     else:
         rows = conn.execute(
             "SELECT id, company_name, job_title, status, updated_at FROM positions "
-            "WHERE assigned_ra = ? AND status <> 'Closed' ORDER BY updated_at DESC", (ra_name,)
+            "WHERE assigned_ra = ? AND status <> 'Exported' ORDER BY updated_at DESC", (ra_name,)
         ).fetchall()
     conn.close()
     return rows
@@ -557,30 +863,47 @@ def get_position(position_id):
     conn = get_connection()
     row = conn.execute(
         "SELECT id, company_name, job_title, status, assigned_ra, source, location, job_url, "
-        "created_by, created_at, updated_at FROM positions WHERE id = ?", (position_id,)
+        "created_by, created_at, updated_at, master_company_id, batch_id, ready_work_date, ready_at, "
+        "ready_by, export_batch_id, exported_at, exported_by FROM positions WHERE id = ?", (position_id,)
     ).fetchone()
     conn.close()
     return row
 
-def update_position(position_id, status=None, job_title=None, assigned_ra=None, location=None, job_url=None):
+def update_position(position_id, status=None, job_title=None, assigned_ra=None, location=None, job_url=None,
+                    actor="System"):
     conn = get_connection()
     row = conn.execute(
-        "SELECT status, job_title, assigned_ra, location, job_url FROM positions WHERE id = ?", (position_id,)
+        "SELECT status, job_title, assigned_ra, location, job_url, batch_id, company_name, master_company_id "
+        "FROM positions WHERE id = ?", (position_id,)
     ).fetchone()
     if row is None:
         conn.close()
         return
-    cur_status, cur_title, cur_ra, cur_loc, cur_url = row
+    cur_status, cur_title, cur_ra, cur_loc, cur_url, batch_id, company_name, master_id = row
+    final_title = job_title if job_title is not None else cur_title
+    final_ra = assigned_ra if assigned_ra is not None else cur_ra
+    final_loc = location if location is not None else cur_loc
+    final_url = job_url if job_url is not None else cur_url
     conn.execute(
         "UPDATE positions SET status = ?, job_title = ?, assigned_ra = ?, location = ?, job_url = ?, "
         "updated_at = ? WHERE id = ?",
         (status if status is not None else cur_status,
-         job_title if job_title is not None else cur_title,
-         assigned_ra if assigned_ra is not None else cur_ra,
-         location if location is not None else cur_loc,
-         job_url if job_url is not None else cur_url,
+         final_title, final_ra, final_loc, final_url,
          date.today().isoformat(), position_id)
     )
+    if batch_id:
+        conn.execute(
+            "UPDATE ra_assignments SET job_title = ?, location = ?, job_url = ?, ra_name = ? "
+            "WHERE batch_id = ? AND company_name = ?",
+            (final_title, final_loc, final_url, final_ra, batch_id, company_name)
+        )
+    if master_id:
+        conn.execute("UPDATE companies SET position = ?, added_by = ? WHERE id = ?",
+                     (final_title, final_ra, master_id))
+    audit_event("update", "position", position_id, actor, {
+        "status": status, "job_title": final_title, "assigned_ra": final_ra,
+        "location": final_loc, "job_url": final_url,
+    }, conn)
     conn.commit()
     conn.close()
 
@@ -636,21 +959,416 @@ def get_position_prospects(position_id):
     conn.close()
     return rows
 
-def update_position_prospect(prospect_id, status=None, notes=None):
+def update_position_prospect(prospect_id, status=None, notes=None, full_name=None, first_name=None,
+                             email=None, designation=None, location=None, linkedin_url=None, actor="System"):
     conn = get_connection()
-    row = conn.execute("SELECT status, notes FROM position_prospects WHERE id = ?", (prospect_id,)).fetchone()
+    row = conn.execute(
+        "SELECT status, notes, full_name, first_name, email, designation, location, linkedin_url "
+        "FROM position_prospects WHERE id = ?", (prospect_id,)
+    ).fetchone()
     if row is None:
         conn.close()
         return
-    cur_status, cur_notes = row
+    cur_status, cur_notes, cur_full, cur_first, cur_email, cur_desig, cur_loc, cur_linkedin = row
     conn.execute(
-        "UPDATE position_prospects SET status = ?, notes = ?, updated_at = ? WHERE id = ?",
+        "UPDATE position_prospects SET status = ?, notes = ?, full_name = ?, first_name = ?, email = ?, "
+        "designation = ?, location = ?, linkedin_url = ?, updated_at = ? WHERE id = ?",
         (status if status is not None else cur_status,
          notes if notes is not None else cur_notes,
-         date.today().isoformat(), prospect_id)
+         full_name if full_name is not None else cur_full,
+         first_name if first_name is not None else cur_first,
+         email.strip().lower() if email is not None else cur_email,
+         designation if designation is not None else cur_desig,
+         location if location is not None else cur_loc,
+         linkedin_url if linkedin_url is not None else cur_linkedin,
+         utc_now_iso(), prospect_id)
     )
+    audit_event("update", "prospect", prospect_id, actor, {}, conn)
     conn.commit()
     conn.close()
+
+EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+def validate_position_for_ready(position_id):
+    """Return field-level errors. Ready is all-or-nothing for the whole position."""
+    pos = get_position(position_id)
+    prospects = get_position_prospects(position_id)
+    errors = []
+    if not pos:
+        return ["Position no longer exists."]
+    if not (pos[2] or "").strip():
+        errors.append("Job Position is required.")
+    if not (pos[6] or "").strip():
+        errors.append("Job Location is required.")
+    if not prospects:
+        errors.append("Add at least one complete prospect.")
+        return errors
+    bounced = get_bounced_email_set()
+    seen = set()
+    conn = get_connection()
+    for index, prospect in enumerate(prospects, start=1):
+        prospect_id, full_name, first_name, email, designation, poc_location, linkedin_url, _, _ = prospect
+        missing = [label for label, value in (
+            ("Full Name", full_name), ("First Name", first_name), ("Email", email),
+            ("Designation", designation), ("POC Location", poc_location),
+        ) if not (value or "").strip()]
+        if missing:
+            errors.append(f"Prospect {index}: missing {', '.join(missing)}.")
+        email_key = (email or "").strip().lower()
+        if email_key and not EMAIL_RE.fullmatch(email_key):
+            errors.append(f"Prospect {index}: invalid email format ({email}).")
+        if email_key in seen:
+            errors.append(f"Prospect {index}: duplicate email within this position ({email_key}).")
+        seen.add(email_key)
+        if email_key and email_key in bounced:
+            errors.append(f"Prospect {index}: {email_key} is in Bounced/DNC.")
+        if linkedin_url and not re.match(r"^https?://", linkedin_url.strip(), re.I):
+            errors.append(f"Prospect {index}: LinkedIn URL must begin with http:// or https://.")
+        if email_key:
+            duplicate = conn.execute(
+                "SELECT p.company_name, p.ready_work_date FROM position_prospects pp "
+                "JOIN positions p ON p.id = pp.position_id "
+                "WHERE LOWER(TRIM(pp.email)) = ? AND pp.id <> ? AND p.status IN ('Ready', 'Exported') LIMIT 1",
+                (email_key, prospect_id)
+            ).fetchone()
+            if duplicate:
+                errors.append(
+                    f"Prospect {index}: {email_key} already exists on {duplicate[0]} "
+                    f"({duplicate[1] or 'date unavailable'})."
+                )
+    conn.close()
+    return errors
+
+def mark_position_ready(position_id, work_date, actor):
+    errors = validate_position_for_ready(position_id)
+    if errors:
+        return False, errors
+    conn = get_connection()
+    now = utc_now_iso()
+    conn.execute(
+        "UPDATE positions SET status = 'Ready', ready_work_date = ?, ready_at = ?, ready_by = ?, "
+        "updated_at = ? WHERE id = ? AND status = 'Open'",
+        (work_date.isoformat(), now, actor, now, position_id)
+    )
+    audit_event("ready", "position", position_id, actor, {"work_date": work_date.isoformat()}, conn)
+    conn.commit()
+    conn.close()
+    return True, []
+
+def return_position_to_open(position_id, actor):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE positions SET status = 'Open', ready_work_date = NULL, ready_at = NULL, ready_by = NULL, "
+        "updated_at = ? WHERE id = ? AND status = 'Ready'",
+        (utc_now_iso(), position_id)
+    )
+    audit_event("return_to_open", "position", position_id, actor, {}, conn)
+    conn.commit()
+    conn.close()
+
+def update_ready_work_date(position_id, work_date, actor):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE positions SET ready_work_date = ?, updated_at = ? WHERE id = ? AND status = 'Ready'",
+        (work_date.isoformat(), utc_now_iso(), position_id)
+    )
+    audit_event("update_work_date", "position", position_id, actor,
+                {"work_date": work_date.isoformat()}, conn)
+    conn.commit()
+    conn.close()
+
+def unlock_exported_position(position_id, actor):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE positions SET status = 'Ready', export_batch_id = NULL, exported_at = NULL, exported_by = NULL, "
+        "updated_at = ? WHERE id = ? AND status = 'Exported'",
+        (utc_now_iso(), position_id)
+    )
+    audit_event("unlock_exported", "position", position_id, actor, {}, conn)
+    conn.commit()
+    conn.close()
+
+def delete_position_workflow(position_id, actor_user, reason_kind, reason_note):
+    """Delete operational records but retain immutable audit/export snapshots."""
+    conn = get_connection()
+    try:
+        pos = conn.execute(
+            "SELECT id, company_name, job_title, status, assigned_ra, source, batch_id, location, job_url, "
+            "created_by, created_at, updated_at, master_company_id, ready_work_date, ready_at, ready_by, "
+            "export_batch_id, exported_at, exported_by FROM positions WHERE id = ?", (position_id,)
+        ).fetchone()
+        if not pos:
+            conn.close()
+            return False, "Position no longer exists."
+        role, actor_name, actor_id = actor_user["role"], actor_user["display_name"], actor_user["id"]
+        company, status, owner = pos[1], pos[3], pos[4]
+        if role == "RA" and owner != actor_name:
+            conn.close()
+            return False, "You can delete only your own positions."
+        if status == "Ready":
+            conn.close()
+            return False, "Return the position to Open before deleting it."
+        if status == "Exported" and role not in ("Manager", "TL"):
+            conn.close()
+            return False, "Only a TL or Manager can delete an Exported position."
+        if reason_kind == "not_eligible" and not reason_note.strip():
+            conn.close()
+            return False, "A Not Eligible explanation is required."
+        prospects = conn.execute(
+            "SELECT id, full_name, first_name, email, designation, location, linkedin_url, status, added_by, "
+            "created_at, updated_at FROM position_prospects WHERE position_id = ? ORDER BY id", (position_id,)
+        ).fetchall()
+        pos_json = json.dumps(pos, default=str)
+        prospects_json = json.dumps(prospects, default=str)
+        if reason_kind == "not_eligible":
+            conn.execute(
+                "INSERT INTO not_eligible_requests (company_name, reason, requested_by, requested_by_user_id, "
+                "requested_at, snapshot_json, status) VALUES (?, ?, ?, ?, ?, ?, 'Pending')",
+                (company, reason_note.strip(), actor_name, actor_id, utc_now_iso(),
+                 json.dumps({"position": pos, "prospects": prospects}, default=str))
+            )
+        elif reason_kind == "assigned_mistake":
+            conn.execute(
+                "INSERT INTO reassignment_queue (company_name, job_title, location, job_url, source_reason, created_at) "
+                "VALUES (?, ?, ?, ?, 'Assigned by mistake', ?) "
+                "ON CONFLICT (company_name) DO UPDATE SET job_title = EXCLUDED.job_title, "
+                "location = EXCLUDED.location, job_url = EXCLUDED.job_url, created_at = EXCLUDED.created_at",
+                (company, pos[2], pos[7], pos[8], utc_now_iso())
+            )
+        conn.execute(
+            "INSERT INTO deletion_audit (position_id, company_name, position_snapshot_json, prospects_snapshot_json, "
+            "export_batch_id, deleted_by, deleted_by_role, deletion_reason, deleted_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (position_id, company, pos_json, prospects_json, pos[16], actor_name, role,
+             f"{reason_kind}: {reason_note.strip()}", utc_now_iso())
+        )
+        conn.execute("DELETE FROM position_prospects WHERE position_id = ?", (position_id,))
+        conn.execute("DELETE FROM positions WHERE id = ?", (position_id,))
+        if pos[6]:
+            conn.execute("DELETE FROM ra_assignments WHERE batch_id = ? AND company_name = ?", (pos[6], company))
+        if pos[12]:
+            conn.execute("DELETE FROM companies WHERE id = ?", (pos[12],))
+        audit_event("delete", "position", position_id, actor_name,
+                    {"company": company, "reason_kind": reason_kind, "reason": reason_note}, conn)
+        conn.commit()
+        conn.close()
+        return True, "Company removed from active workflow."
+    except Exception:
+        conn._conn.rollback()
+        conn.close()
+        raise
+
+def get_not_eligible_requests(status="Pending"):
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id, company_name, reason, requested_by, requested_at, status, reviewed_by, reviewed_at, "
+        "decision_note FROM not_eligible_requests WHERE status = ? ORDER BY id DESC", (status,)
+    ).fetchall()
+    conn.close()
+    return rows
+
+def review_not_eligible_request(request_id, approve, reviewer, decision_note=""):
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT company_name, reason, status, snapshot_json FROM not_eligible_requests WHERE id = ?", (request_id,)
+        ).fetchone()
+        if not row or row[2] != "Pending":
+            conn.close()
+            return False
+        company, reason, _, snapshot_json = row
+        decision = "Approved" if approve else "Rejected"
+        if approve:
+            conn.execute(
+                "INSERT INTO not_eligible_companies (company_name, employee_size, industry, reason) "
+                "VALUES (?, '', '', ?) ON CONFLICT (company_name) DO UPDATE SET reason = EXCLUDED.reason",
+                (company, reason)
+            )
+            conn.execute("DELETE FROM eligible_companies WHERE company_name = ?", (company,))
+            conn.execute("DELETE FROM needs_review_companies WHERE company_name = ?", (company,))
+        else:
+            snapshot = json.loads(snapshot_json)
+            old_pos = snapshot.get("position", [])
+            conn.execute(
+                "INSERT INTO reassignment_queue (company_name, job_title, location, job_url, source_reason, created_at) "
+                "VALUES (?, ?, ?, ?, 'Not Eligible request rejected', ?) "
+                "ON CONFLICT (company_name) DO UPDATE SET job_title = EXCLUDED.job_title, "
+                "location = EXCLUDED.location, job_url = EXCLUDED.job_url, created_at = EXCLUDED.created_at",
+                (company, old_pos[2] if len(old_pos) > 2 else "", old_pos[7] if len(old_pos) > 7 else "",
+                 old_pos[8] if len(old_pos) > 8 else "", utc_now_iso())
+            )
+        conn.execute(
+            "UPDATE not_eligible_requests SET status = ?, reviewed_by = ?, reviewed_at = ?, decision_note = ? "
+            "WHERE id = ?",
+            (decision, reviewer, utc_now_iso(), decision_note.strip(), request_id)
+        )
+        audit_event("approve_not_eligible" if approve else "reject_not_eligible", "request", request_id,
+                    reviewer, {"company": company, "note": decision_note}, conn)
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        conn._conn.rollback()
+        conn.close()
+        raise
+
+def get_active_ra_names():
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT display_name FROM users WHERE active = 1 AND role = 'RA' ORDER BY display_name"
+    ).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def get_reassignment_queue_rows():
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT company_name, job_title, location, job_url FROM reassignment_queue ORDER BY id"
+    ).fetchall()
+    conn.close()
+    return rows
+
+def get_campaign_positions(date_from=None, date_to=None, ra_name=None, statuses=("Ready",)):
+    conn = get_connection()
+    placeholders = ",".join("?" for _ in statuses)
+    sql = (
+        "SELECT p.id, p.company_name, p.job_title, p.location, p.assigned_ra, p.status, "
+        "p.ready_work_date, p.ready_at, COUNT(pp.id) "
+        "FROM positions p LEFT JOIN position_prospects pp ON pp.position_id = p.id "
+        f"WHERE p.status IN ({placeholders})"
+    )
+    params = list(statuses)
+    if date_from:
+        sql += " AND p.ready_work_date >= ?"
+        params.append(date_from)
+    if date_to:
+        sql += " AND p.ready_work_date <= ?"
+        params.append(date_to)
+    if ra_name and ra_name != "All":
+        sql += " AND p.assigned_ra = ?"
+        params.append(ra_name)
+    sql += (
+        " GROUP BY p.id, p.company_name, p.job_title, p.location, p.assigned_ra, p.status, "
+        "p.ready_work_date, p.ready_at ORDER BY p.ready_work_date DESC, p.assigned_ra, p.company_name"
+    )
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    conn.close()
+    return rows
+
+def get_ra_ready_totals(date_from=None, date_to=None):
+    conn = get_connection()
+    sql = (
+        "WITH activity AS ("
+        " SELECT p.id AS position_id, p.ready_work_date AS work_date, p.assigned_ra AS ra_name, "
+        "        'P-' || pp.id::text AS item_key "
+        " FROM positions p JOIN position_prospects pp ON pp.position_id = p.id "
+        " WHERE p.status IN ('Ready', 'Exported') "
+        " UNION ALL "
+        " SELECT d.position_id, d.work_date, d.ra_name, 'E-' || d.id::text FROM ("
+        "   SELECT DISTINCT ON (e.position_id, e.email) e.id, e.position_id, e.work_date, e.ra_name "
+        "   FROM export_batch_items e JOIN export_batches b ON b.batch_id = e.batch_id "
+        "   LEFT JOIN positions p ON p.id = e.position_id WHERE p.id IS NULL "
+        "   ORDER BY e.position_id, e.email, b.created_at DESC"
+        " ) d"
+        ") SELECT work_date, ra_name, COUNT(DISTINCT position_id), COUNT(item_key) "
+        "FROM activity WHERE 1=1"
+    )
+    params = []
+    if date_from:
+        sql += " AND work_date >= ?"
+        params.append(date_from)
+    if date_to:
+        sql += " AND work_date <= ?"
+        params.append(date_to)
+    sql += " GROUP BY work_date, ra_name ORDER BY work_date DESC, ra_name"
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    conn.close()
+    return rows
+
+def create_campaign_export(position_ids, actor):
+    """Create an immutable snapshot and mark all selected Ready positions Exported atomically."""
+    if not position_ids:
+        return None, []
+    conn = get_connection()
+    try:
+        placeholders = ",".join("?" for _ in position_ids)
+        positions = conn.execute(
+            "SELECT id, company_name, job_title, location, assigned_ra, ready_work_date "
+            f"FROM positions WHERE id IN ({placeholders}) AND status = 'Ready' FOR UPDATE",
+            tuple(position_ids)
+        ).fetchall()
+        if len(positions) != len(set(position_ids)):
+            raise ValueError("One or more selected positions are no longer Ready.")
+        batch_id = "EXP-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+        items = []
+        for pid, company, job_title, job_location, ra_name, work_date in positions:
+            prospects = conn.execute(
+                "SELECT full_name, first_name, email, designation, location, linkedin_url "
+                "FROM position_prospects WHERE position_id = ? ORDER BY id", (pid,)
+            ).fetchall()
+            for prospect in prospects:
+                full_name, first_name, email, designation, poc_location, linkedin_url = prospect
+                email = (email or "").strip().lower()
+                snapshot = json.dumps({
+                    "full_name": full_name, "first_name": first_name, "email": email,
+                    "designation": designation, "poc_location": poc_location,
+                    "linkedin_url": linkedin_url,
+                })
+                conn.execute(
+                    "INSERT INTO export_batch_items (batch_id, position_id, company_name, ra_name, work_date, "
+                    "first_name, email, job_position, job_location, prospect_snapshot_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (batch_id, pid, company, ra_name, work_date, first_name, email,
+                     job_title, job_location, snapshot)
+                )
+                items.append((first_name, email, job_title, job_location))
+        now = utc_now_iso()
+        conn.execute(
+            "INSERT INTO export_batches (batch_id, created_by, created_at, position_count, prospect_count) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (batch_id, actor, now, len(positions), len(items))
+        )
+        conn.execute(
+            f"UPDATE positions SET status = 'Exported', export_batch_id = ?, exported_at = ?, exported_by = ?, "
+            f"updated_at = ? WHERE id IN ({placeholders})",
+            tuple([batch_id, now, actor, now] + list(position_ids))
+        )
+        audit_event("export", "export_batch", batch_id, actor,
+                    {"position_ids": position_ids, "prospect_count": len(items)}, conn)
+        conn.commit()
+        conn.close()
+        return batch_id, items
+    except Exception:
+        conn._conn.rollback()
+        conn.close()
+        raise
+
+def get_export_batches(limit=100):
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT batch_id, created_by, created_at, position_count, prospect_count "
+        "FROM export_batches ORDER BY created_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return rows
+
+def get_export_batch_items(batch_id):
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT first_name, email, job_position, job_location FROM export_batch_items "
+        "WHERE batch_id = ? ORDER BY id", (batch_id,)
+    ).fetchall()
+    conn.close()
+    return rows
+
+def get_deletion_audit_rows(limit=200):
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT company_name, deleted_by, deleted_by_role, deletion_reason, deleted_at, export_batch_id "
+        "FROM deletion_audit ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return rows
 
 def get_companies():
     conn = get_connection()
@@ -665,6 +1383,28 @@ def count_companies():
     hot = conn.execute("SELECT COUNT(*) FROM companies WHERE date_added >= ?", (cutoff,)).fetchone()[0]
     conn.close()
     return total, hot
+
+def get_dashboard_metrics():
+    """Fetch dashboard counters in one round trip instead of ten sequential queries."""
+    cutoff = (date.today() - timedelta(days=30)).isoformat()
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT "
+        "(SELECT COUNT(*) FROM companies), "
+        "(SELECT COUNT(*) FROM companies WHERE date_added >= ?), "
+        "(SELECT COUNT(*) FROM eligible_companies), "
+        "(SELECT COUNT(*) FROM not_eligible_companies), "
+        "(SELECT COUNT(*) FROM needs_review_companies), "
+        "(SELECT COUNT(*) FROM prospects), "
+        "(SELECT COUNT(DISTINCT company_key) FROM prospects), "
+        "(SELECT COUNT(*) FROM ra_assignments), "
+        "(SELECT COUNT(*) FROM eod_submissions), "
+        "(SELECT COUNT(*) FROM emails_sent), "
+        "(SELECT COUNT(*) FROM positive_responses)",
+        (cutoff,)
+    ).fetchone()
+    conn.close()
+    return row
 
 def get_existing_keys():
     conn = get_connection()
@@ -934,6 +1674,8 @@ def wipe_entire_database():
     """Empties every table so the app starts exactly like a fresh install. Table structure stays intact."""
     conn = get_connection()
     tables = [
+        "position_prospects", "positions", "not_eligible_requests", "reassignment_queue",
+        "export_batch_items", "export_batches", "deletion_audit", "audit_log",
         "companies", "block_list", "clients", "avoid_list",
         "eligible_companies", "not_eligible_companies", "needs_review_companies",
         "ra_assignments", "prospects", "bounced_emails", "eod_submissions",
@@ -979,9 +1721,8 @@ def set_setting(key, value):
 # ---------- Prospects DB (the 130k-row First Name / Email / Company Name list) ----------
 
 def normalize_company(name):
-    """Lowercase, trim, and collapse whitespace — used only as an internal lookup key.
-    The original company spelling is always what gets stored and shown."""
-    return re.sub(r"\s+", " ", str(name).strip().lower())
+    """Return the exact company spelling; workflow matching is deliberately exact."""
+    return str(name)
 
 
 def add_prospects_from_eod(rows):
@@ -1062,10 +1803,7 @@ def wipe_prospects():
     conn.close()
 
 def lookup_prospects_for_companies(company_names):
-    """Case/whitespace-insensitive lookup for a list of company names (matches the legacy Apps
-    Script's normalise() join). Returns dict keyed by the ORIGINAL input company name (not the
-    normalized key) -> list of (first_name, email) rows, so callers can pair results straight
-    back to their own title/location data without re-normalizing anything themselves."""
+    """Exact-spelling lookup returning rows keyed by the supplied company name."""
     if not company_names:
         return {}
     key_to_original = {}
@@ -1075,7 +1813,7 @@ def lookup_prospects_for_companies(company_names):
     conn = get_connection()
     result = {}
     keys = list(key_to_original.keys())
-    chunk_size = 500  # SQLite has a default limit around 999 placeholders per query
+    chunk_size = 500
     for start in range(0, len(keys), chunk_size):
         chunk = keys[start:start + chunk_size]
         placeholders = ",".join("?" for _ in chunk)
@@ -1092,7 +1830,7 @@ def lookup_prospects_for_companies(company_names):
 
 def map_reengage_to_prospects(reengage_rows):
     """reengage_rows: list of (company, title, location, url, bucket_label).
-    Matches each company against the Prospects DB (case/whitespace-insensitive). A match produces
+    Matches each company against the Prospects DB using exact company spelling. A match produces
     one output row per contact at that company, pairing First Name + Email from the Prospects DB
     with Title + Location carried over from this scrape. No match means we don't currently have
     contacts for that company, so it's returned separately to feed the RA Assignment pool.
@@ -1753,9 +2491,9 @@ def merge_ai_results(existing, new_results):
 def handle_add_company():
     name = st.session_state.company_input.strip()
     position = st.session_state.position_input.strip()
-    ra = st.session_state.ra_name.strip()
-    if ra == "":
-        st.session_state.company_message = ("error", "Please enter your name first.")
+    ra = CURRENT_NAME if CURRENT_ROLE == "RA" else st.session_state.get("manual_target_ra", "")
+    if not ra:
+        st.session_state.company_message = ("error", "Select an active RA first.")
         return
     if name == "" or position == "":
         st.session_state.company_message = ("error", "Both company name and position are required.")
@@ -1774,8 +2512,10 @@ def handle_add_company():
         prev_date, prev_ra = existing
         st.session_state.company_message = ("warning", f"Duplicate: '{name}' was already contacted on {prev_date} by {prev_ra} (within 30 days). Not added.")
         return
-    add_company(name, position, ra)
-    create_position(name, position, ra, "manual", CURRENT_NAME)
+    created = create_manual_company_position(name, position, ra, CURRENT_NAME)
+    if not created:
+        st.session_state.company_message = ("warning", f"'{name}' already has an active position. Not added.")
+        return
     st.session_state.company_message = ("success", f"Added: {name}")
     st.session_state.company_input = ""
     st.session_state.position_input = ""
@@ -1839,6 +2579,18 @@ def _check_auth():
 
     init_db()  # must exist before we can look up users, even pre-login
 
+    # Restore identity after a browser refresh. Only a hash of this short-lived
+    # token is stored in Postgres, and logout/deactivation/role changes revoke it.
+    session_token = st.query_params.get("session", "")
+    restored = get_user_by_session_token(session_token)
+    if restored:
+        user_id, username, display_name, role = restored
+        st.session_state.current_user = {
+            "id": user_id, "username": username,
+            "display_name": display_name, "role": role,
+        }
+        return True
+
     st.markdown("""
     <style>
     .login-wrap { max-width:380px; margin:10vh auto 0; padding:2.4rem 2.2rem 2rem;
@@ -1873,6 +2625,7 @@ def _check_auth():
                     "id": user_id, "username": username,
                     "display_name": display_name, "role": role,
                 }
+                st.query_params["session"] = create_session_token(user_id)
                 st.rerun()
     return False
 
@@ -1881,6 +2634,19 @@ if not _check_auth():
 
 init_db()
 
+# Refresh active/role state on each rerun so deactivation and role changes take
+# effect immediately instead of lingering in an old Streamlit session.
+_fresh_user = get_current_user_record(st.session_state.current_user["id"])
+if not _fresh_user or not _fresh_user[4]:
+    _stale_token = st.query_params.get("session", "")
+    delete_session_token(_stale_token)
+    st.query_params.pop("session", None)
+    st.session_state.pop("current_user", None)
+    st.rerun()
+st.session_state.current_user = {
+    "id": _fresh_user[0], "username": _fresh_user[1],
+    "display_name": _fresh_user[2], "role": _fresh_user[3],
+}
 CURRENT_USER = st.session_state.current_user
 CURRENT_ROLE = CURRENT_USER["role"]          # "Manager" | "TL" | "RA"
 CURRENT_NAME = CURRENT_USER["display_name"]
@@ -2166,20 +2932,36 @@ def stat_cards(cards):
 
 
 # ---------- Sidebar ----------
-NAV = [
-    ("Overview", [("Dashboard", "Dashboard")]),
-    ("Pipeline", [("Bulk scrape", "Bulk scrape"), ("Add company", "Add company"),
-                  ("Review lists", "Review lists"), ("RA assignments", "RA assignments"),
-                  ("Workpage", "Workpage")]),
-    ("Data", [("Prospects DB", "Prospects DB"), ("EOD uploads", "EOD uploads"),
-              ("Bounced & DNC", "Bounced & DNC"), ("Import history", "Import history")]),
-    ("Insight", [("Analytics", "Analytics")]),
-    ("Settings", [("Clients & DNC", "Clients & DNC"), ("Title block list", "Title block list"),
-                  ("Danger zone", "Danger zone")]),
-]
-# Manager-only section — user accounts
-if CURRENT_ROLE == "Manager":
-    NAV.append(("Admin", [("Manage users", "Manage users")]))
+if CURRENT_ROLE == "RA":
+    NAV = [
+        ("Overview", [("Dashboard", "Dashboard")]),
+        ("Pipeline", [("Add company", "Add company"), ("Workpage", "Workpage")]),
+        ("Data", [("EOD uploads", "EOD uploads")]),
+    ]
+elif CURRENT_ROLE == "TL":
+    NAV = [
+        ("Overview", [("Dashboard", "Dashboard")]),
+        ("Pipeline", [("Bulk scrape", "Bulk scrape"), ("Add company", "Add company"),
+                      ("Review lists", "Review lists"), ("RA assignments", "RA assignments"),
+                      ("Workpage", "Workpage"), ("Not Eligible requests", "Not Eligible requests")]),
+        ("Campaign", [("Campaign export", "Campaign export")]),
+        ("Data", [("EOD uploads", "EOD uploads")]),
+        ("Insight", [("Analytics", "Analytics")]),
+    ]
+else:
+    NAV = [
+        ("Overview", [("Dashboard", "Dashboard")]),
+        ("Pipeline", [("Bulk scrape", "Bulk scrape"), ("Add company", "Add company"),
+                      ("Review lists", "Review lists"), ("RA assignments", "RA assignments"),
+                      ("Workpage", "Workpage"), ("Not Eligible requests", "Not Eligible requests")]),
+        ("Campaign", [("Campaign export", "Campaign export")]),
+        ("Data", [("Prospects DB", "Prospects DB"), ("EOD uploads", "EOD uploads"),
+                  ("Bounced & DNC", "Bounced & DNC"), ("Import history", "Import history")]),
+        ("Insight", [("Analytics", "Analytics")]),
+        ("Settings", [("Clients & DNC", "Clients & DNC"), ("Title block list", "Title block list"),
+                      ("Danger zone", "Danger zone")]),
+        ("Admin", [("Manage users", "Manage users")]),
+    ]
 
 with st.sidebar:
     st.markdown('<div class="brand"><span class="brand-mark">RA Workflow</span>'
@@ -2207,7 +2989,9 @@ with st.sidebar:
 
     st.markdown('<div class="nav-group">Account</div>', unsafe_allow_html=True)
     if st.button("Log out", key="logout_btn"):
-        del st.session_state["current_user"]
+        delete_session_token(st.query_params.get("session", ""))
+        st.query_params.pop("session", None)
+        st.session_state.pop("current_user", None)
         st.rerun()
 
 
@@ -2216,11 +3000,8 @@ def page_dashboard():
     page_header("Overview", "Dashboard",
                 "Where every company stands right now — from first scrape through to a booked reply.")
 
-    total_companies, hot = count_companies()
-    n_elig, n_not_elig, n_review = count_eligible(), count_not_eligible(), count_needs_review()
-    n_prospects, n_prospect_cos = count_prospects()
-    n_assign, n_eod = count_assignments(), count_eod()
-    n_sent, n_resp = count_emails_sent(), count_positive_responses()
+    (total_companies, hot, n_elig, n_not_elig, n_review, n_prospects,
+     n_prospect_cos, n_assign, n_eod, n_sent, n_resp) = get_dashboard_metrics()
     reply_rate = (n_resp / n_sent * 100) if n_sent else 0.0
 
     stat_cards([
@@ -2306,8 +3087,10 @@ def page_dashboard():
 def page_add():
     page_header("Pipeline", "Add a company",
                 "For a single company an RA found by hand — checked against clients, DNC and the 30-day duplicate window before it saves.")
-    st.session_state.setdefault("ra_name", CURRENT_NAME)
-    st.text_input("Your name (the RA adding this)", key="ra_name")
+    if CURRENT_ROLE == "RA":
+        st.text_input("Assigned RA", value=CURRENT_NAME, disabled=True, key="manual_ra_display")
+    else:
+        st.selectbox("Assign to RA", get_active_ra_names(), key="manual_target_ra")
     st.text_input("Company name (exact LinkedIn name)", key="company_input")
     st.text_input("Position", key="position_input")
     st.button("Add company", on_click=handle_add_company)
@@ -2408,7 +3191,7 @@ def page_bulk():
         st.subheader("Step 3: Prospects Mapping (re-engage companies)")
         st.write(
             f"Matches your **{len(g['reengage_15_30']):,}** (15-30 day) and **{len(g['reengage_30plus']):,}** "
-            "(30+ day) re-engage companies against the Prospects DB, case/whitespace-insensitive. A match "
+            "(30+ day) re-engage companies against the Prospects DB using exact company spelling. A match "
             "pulls First Name + Email from the Prospects DB and Title + Location from this scrape — one row "
             "per contact. No match means we don't currently have contacts for that company, so it's folded "
             "into the RA Assignment pool below for fresh sourcing instead."
@@ -2590,6 +3373,10 @@ def page_bulk():
             if company not in seen_names:
                 assignment_pool.append((company, title, location, url))
                 seen_names.add(company)
+        for company, title, location, url in get_reassignment_queue_rows():
+            if company not in seen_names:
+                assignment_pool.append((company, title, location, url))
+                seen_names.add(company)
         assignment_pool.sort(key=lambda c: c[0].lower())
 
         # A company already holding an open Workpage position has already been dealt out —
@@ -2615,7 +3402,10 @@ def page_bulk():
             roster_df = pd.DataFrame({"RA Name": [""], "Count": [0]})
             edited_roster = st.data_editor(
                 roster_df, num_rows="dynamic", key="ra_roster_editor", hide_index=True,
-                column_config={"Count": st.column_config.NumberColumn(min_value=0, step=1)},
+                column_config={
+                    "RA Name": st.column_config.SelectboxColumn(options=get_active_ra_names(), required=True),
+                    "Count": st.column_config.NumberColumn(min_value=0, step=1),
+                },
             )
             total_assigned = int(pd.to_numeric(edited_roster["Count"], errors="coerce").fillna(0).sum())
             diff = len(assignment_pool) - total_assigned
@@ -2645,12 +3435,11 @@ def page_bulk():
                         for ra_name, chunk in assignments.items()
                         for (company, title, location, url) in chunk
                     ]
-                    bulk_insert_assignments(rows_to_save)
-                    bulk_create_positions_from_assignments(rows_to_save)
+                    created_count = save_assignment_bundle(rows_to_save, CURRENT_NAME)
                     st.session_state.last_assignment_batch = batch_id
                     st.session_state.last_assignments = assignments
                     st.session_state.last_leftover = leftover
-                    st.success(f"Assigned {len(rows_to_save):,} companies across {len(assignments):,} RA(s). Saved as batch {batch_id}.")
+                    st.success(f"Assigned {created_count:,} companies across {len(assignments):,} RA(s). Saved as batch {batch_id}.")
 
         if "last_assignments" in st.session_state:
             st.caption(f"Last batch: {st.session_state.get('last_assignment_batch', '')}")
@@ -2685,7 +3474,8 @@ def page_block():
         for kw in keywords:
             col1, col2 = st.columns([4, 1])
             col1.write(kw)
-            col2.button("Remove", key=f"rm_{kw}", on_click=handle_remove_keyword, args=(kw,))
+            if CURRENT_ROLE == "Manager":
+                col2.button("Remove", key=f"rm_{kw}", on_click=handle_remove_keyword, args=(kw,))
     else:
         st.info("Block list is empty. Add your usual keywords above.")
     st.divider()
@@ -2739,9 +3529,12 @@ def page_import():
         del st.session_state.import_message
     st.divider()
     st.subheader("Reset")
-    if st.button("Wipe imported history"):
-        wipe_imported_history()
-        st.warning("Imported history wiped.")
+    if CURRENT_ROLE == "Manager":
+        if st.button("Wipe imported history"):
+            wipe_imported_history()
+            st.warning("Imported history wiped.")
+    else:
+        st.caption("Only a Manager can wipe imported history.")
 
 
 def page_lists():
@@ -2764,9 +3557,12 @@ def page_lists():
             names = [str(x).strip() for x in cdf[ccol].tolist() if str(x).strip() and str(x).strip().lower() != "nan"]
             bulk_add_clients(names)
             st.success(f"Imported {len(names):,} client names.")
-    if st.button("Wipe clients list"):
-        wipe_clients()
-        st.warning("Clients list wiped.")
+    if CURRENT_ROLE == "Manager":
+        if st.button("Wipe clients list"):
+            wipe_clients()
+            st.warning("Clients list wiped.")
+    else:
+        st.caption("Only a Manager can wipe the clients list.")
     st.divider()
     st.subheader(f"DNC / Avoid  ·  {count_avoid():,} on file")
     st.text_input("Add a company to avoid", key="avoid_name_input")
@@ -2792,9 +3588,12 @@ def page_lists():
                 pairs.append((nm, reason))
             bulk_add_avoid(pairs)
             st.success(f"Imported {len(pairs):,} companies to the avoid list.")
-    if st.button("Wipe avoid list"):
-        wipe_avoid()
-        st.warning("Avoid list wiped.")
+    if CURRENT_ROLE == "Manager":
+        if st.button("Wipe avoid list"):
+            wipe_avoid()
+            st.warning("Avoid list wiped.")
+    else:
+        st.caption("Only a Manager can wipe the avoid list.")
 
 
 def page_prospects():
@@ -2846,9 +3645,12 @@ def page_prospects():
             st.error(f"Could not read the file: {e}")
 
     st.divider()
-    if st.button("Wipe prospects list"):
-        wipe_prospects()
-        st.warning("Prospects list wiped.")
+    if CURRENT_ROLE == "Manager":
+        if st.button("Wipe prospects list"):
+            wipe_prospects()
+            st.warning("Prospects list wiped.")
+    else:
+        st.caption("Only a Manager can wipe the prospects list.")
 
 
 def page_bounced():
@@ -2889,9 +3691,12 @@ def page_bounced():
             st.error(f"Could not read the file: {e}")
 
     st.divider()
-    if st.button("Wipe bounced/DNC list"):
-        wipe_bounced()
-        st.warning("Bounced/DNC list wiped. (This does not restore any prospects that were already removed.)")
+    if CURRENT_ROLE == "Manager":
+        if st.button("Wipe bounced/DNC list"):
+            wipe_bounced()
+            st.warning("Bounced/DNC list wiped. (This does not restore any prospects that were already removed.)")
+    else:
+        st.caption("Only a Manager can wipe the bounced/DNC list.")
 
 
 def page_review():
@@ -2932,9 +3737,12 @@ def page_review():
     if er:
         st.caption("Most recent (up to 200):")
         st.dataframe(pd.DataFrame(er, columns=["Company Name", "Employee Size", "Industry"]), hide_index=True)
-    if st.button("Wipe eligible list"):
-        wipe_eligible()
-        st.warning("Eligible list wiped.")
+    if CURRENT_ROLE == "Manager":
+        if st.button("Wipe eligible list"):
+            wipe_eligible()
+            st.warning("Eligible list wiped.")
+    else:
+        st.caption("Only a Manager can wipe the eligible list.")
 
     st.divider()
 
@@ -2972,9 +3780,12 @@ def page_review():
     if nr:
         st.caption("Most recent (up to 200):")
         st.dataframe(pd.DataFrame(nr, columns=["Company Name", "Employee Size", "Industry", "Reason"]), hide_index=True)
-    if st.button("Wipe not-eligible list"):
-        wipe_not_eligible()
-        st.warning("Not-eligible list wiped.")
+    if CURRENT_ROLE == "Manager":
+        if st.button("Wipe not-eligible list"):
+            wipe_not_eligible()
+            st.warning("Not-eligible list wiped.")
+    else:
+        st.caption("Only a Manager can wipe the not-eligible list.")
 
     st.divider()
 
@@ -3001,9 +3812,12 @@ def page_review():
                            on_click=resolve_needs_review, args=(rname, "not_eligible"))
     else:
         st.info("Nothing pending review right now.")
-    if st.button("Wipe needs-review queue"):
-        wipe_needs_review()
-        st.warning("Needs-review queue wiped (companies were NOT added to Eligible or Not-eligible).")
+    if CURRENT_ROLE == "Manager":
+        if st.button("Wipe needs-review queue"):
+            wipe_needs_review()
+            st.warning("Needs-review queue wiped (companies were NOT added to Eligible or Not-eligible).")
+    else:
+        st.caption("Only a Manager can wipe the needs-review queue.")
 
 
 def page_assignments():
@@ -3034,139 +3848,256 @@ def page_assignments():
                         st.rerun()
     else:
         st.info("No assignments yet — run Step 5 in the Bulk scrape tab after filtering and the AI check.")
+
     st.divider()
-    if st.button("Wipe assignment history"):
-        wipe_assignments()
-        st.warning("Assignment history wiped.")
+    st.markdown("#### Reassignment queue")
+    queue_rows = get_reassignment_queue_rows()
+    if queue_rows:
+        queue_df = pd.DataFrame(queue_rows, columns=["Company Name", "Job Title", "Location", "Job URL"])
+        queue_df["Assign to RA"] = ""
+        edited_queue = st.data_editor(
+            queue_df, hide_index=True, disabled=["Company Name", "Job Title", "Location", "Job URL"],
+            column_config={
+                "Assign to RA": st.column_config.SelectboxColumn(options=[""] + get_active_ra_names())
+            }, key="reassignment_editor", **FULL
+        )
+        selected = edited_queue[edited_queue["Assign to RA"].astype(str).str.strip() != ""]
+        if st.button("Assign selected queued companies", disabled=selected.empty):
+            batch_id = uuid.uuid4().hex[:10]
+            assigned_date = date.today().isoformat()
+            rows_to_save = [
+                (batch_id, row["Company Name"], row["Job Title"], row["Location"], row["Job URL"],
+                 row["Assign to RA"], assigned_date)
+                for _, row in selected.iterrows()
+            ]
+            created = save_assignment_bundle(rows_to_save, CURRENT_NAME)
+            st.success(f"Assigned {created} queued company/companies in batch {batch_id}.")
+            st.rerun()
+    else:
+        st.caption("No companies waiting for reassignment.")
+    st.divider()
+    if CURRENT_ROLE == "Manager":
+        if st.button("Wipe assignment history"):
+            wipe_assignments()
+            st.warning("Assignment history wiped.")
+    else:
+        st.caption("Only a Manager can wipe assignment history.")
 
 
 def page_workpage():
     page_header("Pipeline", "Workpage",
-                "Your assigned and manually-added companies, worked here directly — the job link, "
-                "location, and the people you're reaching out to for each one.")
-
+                "Edit job details and prospects, then move the entire company to Ready for campaign.")
     is_overseer = CURRENT_ROLE in ("TL", "Manager")
-    can_close = CURRENT_ROLE in ("TL", "Manager")
+
+    if not is_overseer:
+        preferred = get_user_work_date(CURRENT_USER["id"])
+        work_date = st.date_input("Current Work Date", value=preferred, key="wp_work_date")
+        if work_date != preferred:
+            set_user_work_date(CURRENT_USER["id"], work_date)
+            st.success(f"Work Date saved as {work_date.isoformat()} for your next jobs.")
+        st.caption("This date stays selected until you change it. Ready positions keep their saved Work Date.")
+    else:
+        work_date = date.today()
 
     if is_overseer:
         c1, c2 = st.columns(2)
         with c1:
-            ra_names = ["All"] + get_ra_names_with_positions()
-            ra_pick = st.selectbox("View positions for", ra_names, key="wp_ra_filter")
+            ra_pick = st.selectbox("View positions for", ["All"] + get_ra_names_with_positions(), key="wp_ra_filter")
         with c2:
-            status_pick = st.selectbox("Status", ["All", "Open", "Closed"], key="wp_status_filter")
+            status_pick = st.selectbox("Status", ["All", "Open", "Ready", "Exported"], key="wp_status_filter")
         rows = get_all_positions(status_filter=status_pick, ra_filter=ra_pick)
     else:
-        rows = get_positions_for_ra(CURRENT_NAME, include_closed=False)
+        status_pick = st.selectbox("Status", ["All", "Open", "Ready", "Exported"], key="wp_ra_status")
+        rows = get_positions_for_ra(CURRENT_NAME, include_closed=True)
+        if status_pick != "All":
+            rows = [r for r in rows if r[3] == status_pick]
 
     if not rows:
-        st.info("No positions here yet. They appear automatically when you're dealt companies via "
-                 "RA Assignments, or when you add a company yourself on the 'Add company' page.")
+        st.info("No positions match these filters.")
         return
-
-    st.write(f"**{len(rows):,}** position(s) shown.")
 
     def _label(row):
         if is_overseer:
-            pid, company, title, status, assigned_ra, updated = row
-            return f"{company} — {title or '(no title)'} · {status} · {assigned_ra}"
-        else:
-            pid, company, title, status, updated = row
-            return f"{company} — {title or '(no title)'}"
+            pid, company, title, row_status, assigned_ra, _ = row
+            return f"{company} — {title or '(no title)'} · {row_status} · {assigned_ra}"
+        pid, company, title, row_status, _ = row
+        return f"{company} — {title or '(no title)'} · {row_status}"
 
     options = {_label(r): r[0] for r in rows}
-    picked_label = st.selectbox("Open a position", list(options.keys()), key="wp_selected_label")
-    position_id = options[picked_label]
-
-    pos = get_position(position_id)
-    if pos is None:
+    pid = options[st.selectbox("Open a position", list(options.keys()), key="wp_selected_label")]
+    pos = get_position(pid)
+    if not pos:
         st.warning("This position no longer exists.")
         return
-    (pid, company_name, job_title, status, assigned_ra, source,
-     location, job_url, created_by, created_at, updated_at) = pos
+    (pid, company_name, job_title, status, assigned_ra, source, location, job_url,
+     created_by, created_at, updated_at, master_company_id, batch_id, ready_work_date,
+     ready_at, ready_by, export_batch_id, exported_at, exported_by) = pos
+    can_edit = status != "Exported" and (is_overseer or assigned_ra == CURRENT_NAME)
 
-    st.divider()
-    badge = "🟢 Open" if status != "Closed" else "⚪ Closed — sent to campaign"
-    st.markdown(f"#### {company_name}  ·  {badge}")
+    badge = {"Open": "🟢 Open", "Ready": "🟠 Ready for campaign", "Exported": "⚪ Exported"}.get(status, status)
+    st.markdown(f"#### {company_name} · {badge}")
     st.caption(f"Added {created_at} by {created_by} · source: {source} · last updated {updated_at}")
+    if ready_work_date:
+        st.caption(f"Work Date: {ready_work_date} · Ready at: {ready_at} by {ready_by}")
+    if export_batch_id:
+        st.caption(f"Export batch: {export_batch_id} · exported by {exported_by}")
 
     c1, c2 = st.columns(2)
     with c1:
-        new_title = st.text_input("Job title", value=job_title or "", key=f"wp_title_{pid}")
-        new_location = st.text_input("Location", value=location or "", key=f"wp_loc_{pid}")
+        new_title = st.text_input("Job Position", value=job_title or "", disabled=not can_edit, key=f"wp_title_{pid}")
+        new_location = st.text_input("Job Location", value=location or "", disabled=not can_edit, key=f"wp_loc_{pid}")
     with c2:
-        if is_overseer:
-            new_ra = st.text_input("Assigned RA", value=assigned_ra or "", key=f"wp_ra_{pid}")
+        if is_overseer and can_edit:
+            active_ras = get_active_ra_names()
+            ra_options = active_ras if assigned_ra in active_ras else [assigned_ra] + active_ras
+            new_ra = st.selectbox("Assigned RA", ra_options, index=ra_options.index(assigned_ra), key=f"wp_ra_{pid}")
         else:
             new_ra = assigned_ra
             st.text_input("Assigned RA", value=assigned_ra or "", disabled=True, key=f"wp_ra_ro_{pid}")
-        new_url = st.text_input("JD link", value=job_url or "", key=f"wp_url_{pid}")
+        new_url = st.text_input("JD URL", value=job_url or "", disabled=not can_edit, key=f"wp_url_{pid}")
     if job_url:
         st.markdown(f"[Open job posting ↗]({job_url})")
-
-    bc1, bc2 = st.columns([1, 1])
-    with bc1:
-        if st.button("Save position", type="primary", key=f"wp_save_{pid}"):
-            update_position(pid, job_title=new_title, assigned_ra=new_ra, location=new_location, job_url=new_url)
-            st.success("Saved.")
-            st.rerun()
-    with bc2:
-        if can_close:
-            if status != "Closed":
-                if st.button("Close — sent to campaign", key=f"wp_close_{pid}"):
-                    update_position(pid, status="Closed")
-                    st.success("Closed. This company can be re-opened as a fresh position later if needed.")
-                    st.rerun()
-            else:
-                if st.button("Reopen position", key=f"wp_reopen_{pid}"):
-                    update_position(pid, status="Open")
-                    st.success("Reopened.")
-                    st.rerun()
+    if can_edit and st.button("Save job details", type="primary", key=f"wp_save_{pid}"):
+        update_position(pid, job_title=new_title.strip(), assigned_ra=new_ra,
+                        location=new_location.strip(), job_url=new_url.strip(), actor=CURRENT_NAME)
+        st.success("Job details synchronized with Workpage, assignment history, and Master.")
+        st.rerun()
 
     st.divider()
-    st.markdown("#### Prospects for this position")
+    st.markdown("#### Prospects")
     prospects = get_position_prospects(pid)
-    PROSPECT_STATUSES = ["Not contacted", "Emailed", "Replied", "Interested", "Not interested", "Bounced"]
-    if prospects:
-        for prow in prospects:
-            prospect_id, full_name, first_name, email, designation, p_location, linkedin_url, pstatus, pnotes = prow
-            with st.container(border=True):
-                pc1, pc2, pc3, pc4 = st.columns([2, 1.5, 1.5, 1.5])
-                pc1.markdown(f"**{full_name or first_name or '(no name)'}**  \n{email or ''}")
-                pc2.caption(f"{designation or ''}  \n{p_location or ''}")
-                if linkedin_url:
-                    pc3.markdown(f"[LinkedIn ↗]({linkedin_url})")
-                new_pstatus = pc4.selectbox(
-                    "Status", PROSPECT_STATUSES,
-                    index=PROSPECT_STATUSES.index(pstatus) if pstatus in PROSPECT_STATUSES else 0,
-                    key=f"wp_pstatus_{prospect_id}", label_visibility="collapsed"
-                )
-                if new_pstatus != pstatus:
-                    update_position_prospect(prospect_id, status=new_pstatus)
+    for index, prow in enumerate(prospects, start=1):
+        prospect_id, full_name, first_name, email, designation, p_location, linkedin_url, pstatus, pnotes = prow
+        with st.expander(f"Prospect {index}: {full_name or first_name or email or '(incomplete)'}", expanded=False):
+            p1, p2 = st.columns(2)
+            with p1:
+                efull = st.text_input("Full Name", full_name or "", disabled=not can_edit, key=f"ep_full_{prospect_id}")
+                efirst = st.text_input("First Name", first_name or "", disabled=not can_edit, key=f"ep_first_{prospect_id}")
+                eemail = st.text_input("Email", email or "", disabled=not can_edit, key=f"ep_email_{prospect_id}")
+            with p2:
+                edesig = st.text_input("Designation", designation or "", disabled=not can_edit, key=f"ep_desig_{prospect_id}")
+                eloc = st.text_input("POC Location", p_location or "", disabled=not can_edit, key=f"ep_loc_{prospect_id}")
+                elink = st.text_input("LinkedIn URL (optional)", linkedin_url or "", disabled=not can_edit,
+                                      key=f"ep_link_{prospect_id}")
+            if can_edit and st.button("Save prospect", key=f"ep_save_{prospect_id}"):
+                email_key = eemail.strip().lower()
+                if email_key and not EMAIL_RE.fullmatch(email_key):
+                    st.error("Enter a valid email address.")
+                elif email_key and email_key in get_bounced_email_set():
+                    st.error("This email is in Bounced/DNC and cannot be saved.")
+                elif elink.strip() and not re.match(r"^https?://", elink.strip(), re.I):
+                    st.error("LinkedIn URL must begin with http:// or https://.")
+                else:
+                    update_position_prospect(
+                        prospect_id, full_name=efull.strip(), first_name=efirst.strip(), email=eemail,
+                        designation=edesig.strip(), location=eloc.strip(), linkedin_url=elink.strip(), actor=CURRENT_NAME
+                    )
+                    st.success("Prospect saved.")
                     st.rerun()
-    else:
-        st.caption("No prospects added for this position yet.")
+    if not prospects:
+        st.caption("No prospects added yet.")
 
-    with st.expander("Add prospects", expanded=(len(prospects) == 0)):
-        st.caption("Add as many as you need — click the + at the bottom-left of the table for another row.")
-        empty_df = pd.DataFrame(
-            [{"Full Name": "", "First Name": "", "Email": "", "Designation": "", "Location": "", "LinkedIn URL": ""}]
+    if can_edit:
+        with st.expander("Add prospects", expanded=not prospects):
+            st.caption("LinkedIn URL is optional. All other fields are required before Ready.")
+            empty_df = pd.DataFrame([{
+                "Full Name": "", "First Name": "", "Email": "", "Designation": "",
+                "POC Location": "", "LinkedIn URL": "",
+            }])
+            edited = st.data_editor(empty_df, num_rows="dynamic", hide_index=True,
+                                    key=f"wp_new_prospects_{pid}", **FULL)
+            if st.button("Save new prospects", key=f"wp_addp_{pid}"):
+                rows_to_add = [
+                    (r.get("Full Name", ""), r.get("First Name", ""),
+                     str(r.get("Email", "")).strip().lower(), r.get("Designation", ""),
+                     r.get("POC Location", ""), r.get("LinkedIn URL", ""))
+                    for r in edited.to_dict("records")
+                ]
+                populated = [r for r in rows_to_add if any(str(v or "").strip() for v in r)]
+                bounced = get_bounced_email_set()
+                input_errors = []
+                emails = []
+                existing_emails = {(p[3] or "").strip().lower() for p in prospects if (p[3] or "").strip()}
+                for row_number, row in enumerate(populated, start=1):
+                    email_key = str(row[2] or "").strip().lower()
+                    if email_key and not EMAIL_RE.fullmatch(email_key):
+                        input_errors.append(f"Row {row_number}: invalid email format.")
+                    if email_key in bounced:
+                        input_errors.append(f"Row {row_number}: email is in Bounced/DNC.")
+                    if email_key in emails:
+                        input_errors.append(f"Row {row_number}: duplicate email in this position.")
+                    if email_key and email_key in existing_emails:
+                        input_errors.append(f"Row {row_number}: this email is already on the position.")
+                    emails.append(email_key)
+                    if row[5] and not re.match(r"^https?://", str(row[5]).strip(), re.I):
+                        input_errors.append(f"Row {row_number}: LinkedIn URL must begin with http:// or https://.")
+                if input_errors:
+                    for error in input_errors:
+                        st.error(error)
+                elif populated:
+                    n_added = bulk_add_position_prospects(pid, populated, CURRENT_NAME)
+                    st.success(f"Added {n_added} prospect(s).")
+                    st.rerun()
+                else:
+                    st.error("Enter at least one prospect row.")
+
+    st.divider()
+    if status == "Open":
+        ready_date = work_date if not is_overseer else st.date_input(
+            "Work Date for Ready", value=date.today(), key=f"ready_date_{pid}"
         )
-        edited = st.data_editor(
-            empty_df, num_rows="dynamic", hide_index=True, key=f"wp_new_prospects_{pid}", **FULL
-        )
-        if st.button("Save prospects", key=f"wp_addp_{pid}"):
-            rows_to_add = [
-                (r.get("Full Name", ""), r.get("First Name", ""), r.get("Email", ""),
-                 r.get("Designation", ""), r.get("Location", ""), r.get("LinkedIn URL", ""))
-                for r in edited.to_dict("records")
-            ]
-            n_added = bulk_add_position_prospects(pid, rows_to_add, CURRENT_NAME)
-            if n_added == 0:
-                st.error("Enter at least a name or email in one row.")
-            else:
-                st.success(f"Added {n_added} prospect(s).")
+        if st.button("Ready for campaign", type="primary", key=f"ready_{pid}"):
+            ok, errors = mark_position_ready(pid, ready_date, CURRENT_NAME)
+            if ok:
+                if not is_overseer:
+                    set_user_work_date(CURRENT_USER["id"], ready_date)
+                st.success("Entire position and company are Ready for campaign.")
                 st.rerun()
+            for error in errors:
+                st.error(error)
+    elif status == "Ready":
+        st.info("This position remains editable until it is Exported.")
+        saved_ready_date = date.fromisoformat(ready_work_date) if ready_work_date else date.today()
+        corrected_date = st.date_input("Saved Work Date", value=saved_ready_date, key=f"correct_ready_date_{pid}")
+        if corrected_date != saved_ready_date and st.button("Save corrected Work Date", key=f"save_ready_date_{pid}"):
+            update_ready_work_date(pid, corrected_date, CURRENT_NAME)
+            if not is_overseer:
+                set_user_work_date(CURRENT_USER["id"], corrected_date)
+            st.success("Work Date corrected and audited.")
+            st.rerun()
+        if st.button("Return to Open", key=f"return_open_{pid}"):
+            return_position_to_open(pid, CURRENT_NAME)
+            st.rerun()
+    elif status == "Exported" and is_overseer:
+        if st.button("Unlock Exported position for correction", key=f"unlock_{pid}"):
+            unlock_exported_position(pid, CURRENT_NAME)
+            st.warning("Unlocked to Ready. It must be exported again after corrections.")
+            st.rerun()
+
+    can_delete = (status == "Open") or (status == "Exported" and is_overseer)
+    if can_delete:
+        with st.expander("Delete this company"):
+            if status == "Exported":
+                reason_kind = "exported_delete"
+                st.warning("The immutable export and deletion audit will be retained.")
+            else:
+                label = st.radio(
+                    "Reason", ["Assigned by mistake", "Request Not Eligible"],
+                    key=f"del_reason_{pid}"
+                )
+                reason_kind = "assigned_mistake" if label == "Assigned by mistake" else "not_eligible"
+            reason_note = st.text_area(
+                "Explanation" + (" (required)" if reason_kind != "assigned_mistake" else ""),
+                key=f"del_note_{pid}"
+            )
+            confirm = st.text_input(f"Type {company_name} to confirm", key=f"del_confirm_{pid}")
+            disabled = confirm != company_name or (reason_kind != "assigned_mistake" and not reason_note.strip())
+            if st.button("Delete company", disabled=disabled, key=f"delete_position_{pid}"):
+                ok, message = delete_position_workflow(pid, CURRENT_USER, reason_kind, reason_note)
+                if ok:
+                    st.success(message)
+                    st.rerun()
+                st.error(message)
 
 
 def page_eod():
@@ -3181,7 +4112,9 @@ def page_eod():
 
     st.subheader("Upload your EOD sheet")
     st.session_state.setdefault("eod_ra_name", CURRENT_NAME)
-    eod_ra_name = st.text_input("Your name (RA)", key="eod_ra_name")
+    eod_ra_name = st.text_input("Your name (RA)", key="eod_ra_name", disabled=(CURRENT_ROLE == "RA"))
+    if CURRENT_ROLE == "RA":
+        eod_ra_name = CURRENT_NAME
     eod_date = st.date_input("Date", value=date.today(), key="eod_date")
     eod_file = st.file_uploader(
         "Upload EOD CSV (Company Name, Company LinkedIn URL, Full Name, First Name, POC Location, "
@@ -3243,6 +4176,9 @@ def page_eod():
         except Exception as e:
             st.error(f"Could not read the file: {e}")
 
+    if CURRENT_ROLE == "RA":
+        return
+
     st.divider()
     st.subheader("TL / Manager: view and download by RA")
     ra_list = get_eod_ra_list()
@@ -3287,9 +4223,138 @@ def page_eod():
         st.info("No EOD uploads yet.")
 
     st.divider()
-    if st.button("Wipe EOD history"):
-        wipe_eod()
-        st.warning("EOD history wiped. (Prospects already added to the Prospects DB from it are NOT removed.)")
+    if CURRENT_ROLE == "Manager":
+        if st.button("Wipe EOD history"):
+            wipe_eod()
+            st.warning("EOD history wiped. (Prospects already added to the Prospects DB from it are NOT removed.)")
+    else:
+        st.caption("Only a Manager can wipe EOD history.")
+
+
+def _campaign_dataframe(items):
+    df = pd.DataFrame(items, columns=["FIRST NAME", "EMAIL ID", "POSITION", "LOCATION"])
+    for col in df.columns:
+        df[col] = df[col].fillna("").astype(str).map(
+            lambda value: "'" + value if value.startswith(("=", "+", "-", "@")) else value
+        )
+    return df
+
+
+def page_campaign_export():
+    page_header("Campaign", "Campaign export",
+                "RA-wise Ready totals, campaign-ready downloads, and immutable export history.")
+    if CURRENT_ROLE not in ("Manager", "TL"):
+        st.error("Only a TL or Manager can access campaign exports.")
+        return
+
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        date_from = st.date_input("From Work Date", value=date.today(), key="campaign_from")
+    with f2:
+        date_to = st.date_input("To Work Date", value=date.today(), key="campaign_to")
+    with f3:
+        ra_filter = st.selectbox("RA", ["All"] + get_ra_names_with_positions(), key="campaign_ra")
+
+    totals = get_ra_ready_totals(date_from.isoformat(), date_to.isoformat())
+    totals_df = pd.DataFrame(totals, columns=["Work Date", "RA", "Positions Ready", "Prospects"])
+    st.markdown("#### Daily RA totals")
+    if totals_df.empty:
+        st.info("No Ready or Exported work for this date range.")
+    else:
+        st.dataframe(totals_df, hide_index=True, **FULL)
+        st.download_button("Download RA totals", totals_df.to_csv(index=False),
+                           "ra_daily_totals.csv", "text/csv")
+
+    st.markdown("#### Ready positions")
+    ready_rows = get_campaign_positions(date_from.isoformat(), date_to.isoformat(), ra_filter, ("Ready",))
+    labels = {
+        f"{company} · {ra_name} · {work_date} · {prospect_count} prospect(s)": pid
+        for pid, company, title, location, ra_name, row_status, work_date, ready_at, prospect_count in ready_rows
+    }
+    selected_labels = st.multiselect("Select positions to export", list(labels.keys()), key="campaign_selected")
+    selected_ids = [labels[label] for label in selected_labels]
+    if selected_ids:
+        preview_rows = [row for row in ready_rows if row[0] in selected_ids]
+        preview_df = pd.DataFrame(preview_rows, columns=[
+            "Position ID", "Company", "Job Position", "Job Location", "RA", "Status",
+            "Work Date", "Ready At", "Prospects",
+        ])
+        st.dataframe(preview_df, hide_index=True, **FULL)
+    if st.button("Create export batch and mark Exported", type="primary", disabled=not selected_ids):
+        validation_errors = []
+        for selected_id in selected_ids:
+            validation_errors.extend(validate_position_for_ready(selected_id))
+        if validation_errors:
+            for error in validation_errors:
+                st.error(error)
+        else:
+            try:
+                batch_id, items = create_campaign_export(selected_ids, CURRENT_NAME)
+                st.session_state.last_campaign_export = (batch_id, items)
+                st.success(f"Created {batch_id}: {len(items):,} prospect(s) marked Exported.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Export could not be created: {exc}")
+
+    if st.session_state.get("last_campaign_export"):
+        batch_id, items = st.session_state.last_campaign_export
+        export_df = _campaign_dataframe(items)
+        st.download_button(
+            f"Download {batch_id}", export_df.to_csv(index=False), f"{batch_id}.csv", "text/csv",
+            key=f"download_{batch_id}"
+        )
+
+    st.divider()
+    st.markdown("#### Export history")
+    batches = get_export_batches()
+    if batches:
+        batch_labels = {
+            f"{batch_id} · {created_at} · {created_by} · {prospects} prospects": batch_id
+            for batch_id, created_by, created_at, positions, prospects in batches
+        }
+        history_label = st.selectbox("Previous export", list(batch_labels.keys()), key="export_history_pick")
+        history_id = batch_labels[history_label]
+        history_df = _campaign_dataframe(get_export_batch_items(history_id))
+        st.dataframe(history_df, hide_index=True, **FULL)
+        st.download_button("Re-download this export", history_df.to_csv(index=False),
+                           f"{history_id}.csv", "text/csv", key=f"redownload_{history_id}")
+    else:
+        st.caption("No export batches yet.")
+
+    with st.expander("Deletion audit"):
+        deleted = get_deletion_audit_rows()
+        if deleted:
+            deleted_df = pd.DataFrame(deleted, columns=[
+                "Company", "Deleted By", "Role", "Reason", "Deleted At", "Export Batch",
+            ])
+            st.dataframe(deleted_df, hide_index=True, **FULL)
+        else:
+            st.caption("No deleted positions.")
+
+
+def page_approval_requests():
+    page_header("Review", "Not Eligible requests",
+                "Approve or reject RA requests. Pending companies stay out of the assignment pool.")
+    if CURRENT_ROLE not in ("Manager", "TL"):
+        st.error("Only a TL or Manager can review requests.")
+        return
+    pending = get_not_eligible_requests("Pending")
+    if not pending:
+        st.info("No pending requests.")
+        return
+    for request_id, company, reason, requested_by, requested_at, status, reviewed_by, reviewed_at, note in pending:
+        with st.container(border=True):
+            st.markdown(f"**{company}**")
+            st.write(reason)
+            st.caption(f"Requested by {requested_by} at {requested_at}")
+            decision_note = st.text_input("Reviewer note (optional)", key=f"approval_note_{request_id}")
+            a1, a2 = st.columns(2)
+            if a1.button("Approve Not Eligible", type="primary", key=f"approve_{request_id}"):
+                review_not_eligible_request(request_id, True, CURRENT_NAME, decision_note)
+                st.rerun()
+            if a2.button("Reject and return to pool", key=f"reject_{request_id}"):
+                review_not_eligible_request(request_id, False, CURRENT_NAME, decision_note)
+                st.rerun()
 
 
 def page_analytics():
@@ -3337,9 +4402,12 @@ def page_analytics():
                 st.success(f"Added {len(rows):,} emails-sent rows.")
         except Exception as e:
             st.error(f"Could not read the file: {e}")
-    if st.button("Wipe emails-sent data"):
-        wipe_emails_sent()
-        st.warning("Emails-sent data wiped.")
+    if CURRENT_ROLE == "Manager":
+        if st.button("Wipe emails-sent data"):
+            wipe_emails_sent()
+            st.warning("Emails-sent data wiped.")
+    else:
+        st.caption("Only a Manager can wipe emails-sent data.")
 
     st.divider()
     st.subheader("Upload: Positive Responses")
@@ -3375,9 +4443,12 @@ def page_analytics():
                 st.success(f"Added {len(rows):,} positive-response rows.")
         except Exception as e:
             st.error(f"Could not read the file: {e}")
-    if st.button("Wipe positive-responses data"):
-        wipe_positive_responses()
-        st.warning("Positive-responses data wiped.")
+    if CURRENT_ROLE == "Manager":
+        if st.button("Wipe positive-responses data"):
+            wipe_positive_responses()
+            st.warning("Positive-responses data wiped.")
+    else:
+        st.caption("Only a Manager can wipe positive-responses data.")
 
     st.divider()
     st.subheader("Title-bucket keywords")
@@ -3397,7 +4468,8 @@ def page_analytics():
         for kw in kw_list:
             kc1, kc2 = st.columns([4, 1])
             kc1.write(kw)
-            kc2.button("Remove", key=f"rm_titlekw_{kw}", on_click=remove_title_bucket_keyword, args=(kw,))
+            if CURRENT_ROLE == "Manager":
+                kc2.button("Remove", key=f"rm_titlekw_{kw}", on_click=remove_title_bucket_keyword, args=(kw,))
 
     st.divider()
     st.subheader("Results")
@@ -3437,6 +4509,9 @@ def page_analytics():
 def page_danger():
     page_header("Settings", "Danger zone",
                 "Reset the app to a clean slate. Useful for testing, permanent in effect.")
+    if CURRENT_ROLE != "Manager":
+        st.error("Only a Manager can access the Danger zone.")
+        return
     st.error(
         "This permanently empties EVERY table — companies, block list, clients, DNC/avoid, "
         "and eligible/not-eligible lists. There is no undo. Use this only to reset the app for testing."
@@ -3542,6 +4617,8 @@ ROUTES = {
     "Review lists": page_review,
     "RA assignments": page_assignments,
     "Workpage": page_workpage,
+    "Not Eligible requests": page_approval_requests,
+    "Campaign export": page_campaign_export,
     "Prospects DB": page_prospects,
     "EOD uploads": page_eod,
     "Bounced & DNC": page_bounced,
@@ -3553,4 +4630,27 @@ ROUTES = {
     "Manage users": page_users,
 }
 
-ROUTES.get(st.session_state.page, page_dashboard)()
+PAGE_ROLES = {
+    "Dashboard": {"Manager", "TL", "RA"},
+    "Add company": {"Manager", "TL", "RA"},
+    "Workpage": {"Manager", "TL", "RA"},
+    "EOD uploads": {"Manager", "TL", "RA"},
+    "Bulk scrape": {"Manager", "TL"},
+    "Review lists": {"Manager", "TL"},
+    "RA assignments": {"Manager", "TL"},
+    "Not Eligible requests": {"Manager", "TL"},
+    "Campaign export": {"Manager", "TL"},
+    "Analytics": {"Manager", "TL"},
+    "Prospects DB": {"Manager"},
+    "Bounced & DNC": {"Manager"},
+    "Import history": {"Manager"},
+    "Clients & DNC": {"Manager"},
+    "Title block list": {"Manager"},
+    "Danger zone": {"Manager"},
+    "Manage users": {"Manager"},
+}
+requested_page = st.session_state.page
+if CURRENT_ROLE not in PAGE_ROLES.get(requested_page, {"Manager"}):
+    st.error("You do not have permission to access this page.")
+else:
+    ROUTES.get(requested_page, page_dashboard)()

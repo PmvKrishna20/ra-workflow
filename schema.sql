@@ -166,3 +166,135 @@ INSERT INTO title_bucket_keywords (keyword) VALUES
     ('Mechanic'),('Driver'),('Foreman'),('Executive'),('Officer'),
     ('CFO'),('CEO'),('COO'),('CTO'),('VP')
 ON CONFLICT (keyword) DO NOTHING;
+
+-- Workpage, persistent sessions, approvals, exports, and audit history.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS work_date_preference TEXT;
+
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS positions (
+    id SERIAL PRIMARY KEY,
+    company_name TEXT NOT NULL,
+    job_title TEXT,
+    status TEXT NOT NULL DEFAULT 'Open',
+    assigned_ra TEXT,
+    source TEXT,
+    batch_id TEXT,
+    location TEXT,
+    job_url TEXT,
+    created_by TEXT,
+    created_at TEXT,
+    updated_at TEXT,
+    master_company_id INTEGER,
+    ready_work_date TEXT,
+    ready_at TEXT,
+    ready_by TEXT,
+    export_batch_id TEXT,
+    exported_at TEXT,
+    exported_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS position_prospects (
+    id SERIAL PRIMARY KEY,
+    position_id INTEGER NOT NULL,
+    full_name TEXT,
+    first_name TEXT,
+    email TEXT,
+    designation TEXT,
+    location TEXT,
+    linkedin_url TEXT,
+    status TEXT NOT NULL DEFAULT 'Not contacted',
+    notes TEXT,
+    added_by TEXT,
+    created_at TEXT,
+    updated_at TEXT
+);
+
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS master_company_id INTEGER;
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS ready_work_date TEXT;
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS ready_at TEXT;
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS ready_by TEXT;
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS export_batch_id TEXT;
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS exported_at TEXT;
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS exported_by TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_positions_assigned_ra ON positions(assigned_ra);
+CREATE INDEX IF NOT EXISTS idx_positions_ready_work_date ON positions(ready_work_date);
+CREATE INDEX IF NOT EXISTS idx_position_prospects_position ON position_prospects(position_id);
+DROP INDEX IF EXISTS idx_positions_one_active_per_company;
+CREATE UNIQUE INDEX idx_positions_one_active_per_company
+    ON positions(company_name) WHERE status <> 'Exported';
+
+CREATE TABLE IF NOT EXISTS not_eligible_requests (
+    id SERIAL PRIMARY KEY,
+    company_name TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    requested_by TEXT NOT NULL,
+    requested_by_user_id INTEGER,
+    requested_at TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'Pending',
+    reviewed_by TEXT,
+    reviewed_at TEXT,
+    decision_note TEXT
+);
+
+CREATE TABLE IF NOT EXISTS reassignment_queue (
+    id SERIAL PRIMARY KEY,
+    company_name TEXT NOT NULL UNIQUE,
+    job_title TEXT,
+    location TEXT,
+    job_url TEXT,
+    source_reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS deletion_audit (
+    id SERIAL PRIMARY KEY,
+    position_id INTEGER,
+    company_name TEXT NOT NULL,
+    position_snapshot_json TEXT NOT NULL,
+    prospects_snapshot_json TEXT NOT NULL,
+    export_batch_id TEXT,
+    deleted_by TEXT NOT NULL,
+    deleted_by_role TEXT NOT NULL,
+    deletion_reason TEXT NOT NULL,
+    deleted_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS export_batches (
+    batch_id TEXT PRIMARY KEY,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    position_count INTEGER NOT NULL,
+    prospect_count INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS export_batch_items (
+    id SERIAL PRIMARY KEY,
+    batch_id TEXT NOT NULL,
+    position_id INTEGER NOT NULL,
+    company_name TEXT NOT NULL,
+    ra_name TEXT,
+    work_date TEXT,
+    first_name TEXT NOT NULL,
+    email TEXT NOT NULL,
+    job_position TEXT NOT NULL,
+    job_location TEXT NOT NULL,
+    prospect_snapshot_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id SERIAL PRIMARY KEY,
+    action TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT,
+    actor TEXT NOT NULL,
+    details_json TEXT,
+    created_at TEXT NOT NULL
+);
